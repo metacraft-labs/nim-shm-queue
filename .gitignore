@@ -1,0 +1,5 @@
+nimcache/
+*.exe
+build/
+.repro/
+/tmp/
