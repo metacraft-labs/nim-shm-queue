@@ -1,0 +1,7 @@
+# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
+# revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+#
+# nim-shm-queue is a leaf library with NO `uses:` sibling edges (self-only
+# lock). The status-im serialization/faststreams/stew trees the L2 suite
+# compiles against are third-party (threaded via `--path`, not `uses:`), so
+# there are no cross-repo siblings to clone here.

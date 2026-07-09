@@ -1,0 +1,9 @@
+schema = "reprobuild.solved-graph-lock.v2"
+
+[lock]
+platform = "amd64-linux"
+optimal = false
+inputs_digest = "fnv1a64:417d3dc9d2c8e7c3"
+variants = []
+packages = [{ name = "gcc", version = "12.0.0", source = "gcc" }, { name = "nim", version = "2.0.0", source = "nim" }, { name = "shm_queue", version = "0.1.0", source = "shm_queue" }]
+deps = [{ name = "nim-shm-queue", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-shm-queue.git", ref = "main", revision = "08d87d26067568e980f4356c4abcf2a0d841a310", integrity = "git-sha1:08d87d26067568e980f4356c4abcf2a0d841a310", version = "", visibility = "public", participation = "", depends = "", groups = "" }]
