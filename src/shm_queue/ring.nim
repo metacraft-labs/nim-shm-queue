@@ -35,7 +35,8 @@
 
 import ./segment
 export segment.ShmSegment, segment.isValid, segment.bootId,
-  segment.shmSegmentSupported
+  segment.shmSegmentSupported, segment.embeddedRingSize,
+  segment.embeddedRingHeaderSize
 
 type
   ShmRing* = object
@@ -78,44 +79,43 @@ proc detach*(r: var ShmRing) =
 
 when shmSegmentSupported:
 
-  func slotOff(r: ShmRing; ticket: uint64): int {.inline.} =
-    SegHeaderSize + int(ticket mod uint64(r.seg.capacity)) *
-      slotStrideFor(r.seg.maxBlobLen)
+  # --- core coordination over (base, ringBase, cap, maxBlobLen) -------------
+  #
+  # The ticket-CAS reservation / release-store publish / single-consumer drain
+  # protocol, parameterised by the mapped `base`, the byte offset of the ring
+  # header (`ringBase`), and the ring geometry. Both the segment-owning
+  # `ShmRing` (ringBase = 0, geometry from the segment header) and the
+  # `EmbeddedRing` (ring header embedded at `ringBase` inside a caller-owned
+  # region — e.g. reprobuild's action-cache control region) delegate here, so
+  # exactly ONE copy of the coordination code exists.
 
-  # --- multi-producer push (CAS tail) --------------------------------------
+  func slotOffAt(ringBase, cap, maxBlobLen: int; ticket: uint64): int {.inline.} =
+    ringBase + ringSlotsBaseOffset() +
+      int(ticket mod uint64(cap)) * slotStrideFor(maxBlobLen)
 
-  proc tryPush*(r: var ShmRing; blob: openArray[byte]): PushResult =
-    ## Lock-free multi-producer push. Reserves a ticket by CAS-bumping `tail`,
-    ## writes `blob` (u32 length prefix + bytes) into the reserved slot, and
-    ## publishes via a release-store of `ready = ticket+1`. Bounded: a full ring
-    ## bumps the atomic `dropped` counter and returns `prDropped` (SIGNALLED,
-    ## never silent, never overwriting an unread slot). A blob longer than the
-    ## segment's `maxBlobLen` returns `prOversize` with the ring unchanged.
-    if not r.seg.isValid:
+  proc pushBlob(base: ShmBase; ringBase, cap, maxBlobLen: int;
+      blob: openArray[byte]): PushResult =
+    if blob.len > maxBlobLen:
       return prOversize
-    if blob.len > r.seg.maxBlobLen:
-      return prOversize
-    let base = r.seg.base
-    let cap = uint64(r.seg.capacity)
-    var tail = loadU64Acquire(base, HdrOffTail)
+    var tail = loadU64Acquire(base, ringBase + RingOffTail)
     while true:
-      let head = loadU64Acquire(base, HdrOffHead)
-      if tail - head >= cap:
+      let head = loadU64Acquire(base, ringBase + RingOffHead)
+      if tail - head >= uint64(cap):
         # Ring full. Re-check tail once (it may have advanced under us) before
         # committing to a drop, then signal the drop via the atomic counter.
-        let tailNow = loadU64Acquire(base, HdrOffTail)
+        let tailNow = loadU64Acquire(base, ringBase + RingOffTail)
         if tailNow != tail:
           tail = tailNow
           continue
-        discard fetchAddU64(base, HdrOffDropped, 1)
+        discard fetchAddU64(base, ringBase + RingOffDropped, 1)
         return prDropped
       # Reserve `tail` by advancing it to tail+1. On CAS failure `tail` is
       # refreshed with the observed value and we retry.
-      if casU64(base, HdrOffTail, tail, tail + 1):
+      if casU64(base, ringBase + RingOffTail, tail, tail + 1):
         break
     # We own ticket `tail`. Its slot is free: the consumer cleared `ready` for
     # the previous occupant (ticket tail-cap) before advancing head past it.
-    let so = slotOff(r, tail)
+    let so = slotOffAt(ringBase, cap, maxBlobLen, tail)
     if blob.len > 0:
       copyMem(addr base[so + SlotOffBlob], unsafeAddr blob[0], blob.len)
     storeU32Release(base, so + SlotOffBlobLen, uint32(blob.len))
@@ -124,24 +124,14 @@ when shmSegmentSupported:
     storeU64Release(base, so + SlotOffReady, tail + 1)
     prPushed
 
-  # --- single-consumer drain -----------------------------------------------
-
-  proc tryDrainOne*(r: var ShmRing; outBuf: var openArray[byte];
-      outLen: var int): DrainResult =
-    ## SINGLE-consumer non-blocking drain of the next ready ticket. Returns
-    ## `drEmpty` when the head slot is not yet published (empty ring or a
-    ## producer mid-write — a torn/unpublished slot is SKIPPED, never read).
-    ## Returns `drOverflowBuf` (ring unchanged) when `outBuf` is smaller than
-    ## the stored blob. On `drGot`, `outLen` bytes were copied into `outBuf`.
+  proc drainBlob(base: ShmBase; ringBase, cap, maxBlobLen: int;
+      outBuf: var openArray[byte]; outLen: var int): DrainResult =
     outLen = 0
-    if not r.seg.isValid:
-      return drEmpty
-    let base = r.seg.base
-    let head = loadU64Relaxed(base, HdrOffHead) # consumer-owned
-    let tail = loadU64Acquire(base, HdrOffTail)
+    let head = loadU64Relaxed(base, ringBase + RingOffHead) # consumer-owned
+    let tail = loadU64Acquire(base, ringBase + RingOffTail)
     if head >= tail:
       return drEmpty # nothing reserved past head
-    let so = slotOff(r, head)
+    let so = slotOffAt(ringBase, cap, maxBlobLen, head)
     let ready = loadU64Acquire(base, so + SlotOffReady)
     if ready != head + 1:
       return drEmpty # producer still publishing
@@ -157,8 +147,33 @@ when shmSegmentSupported:
     # Retire the slot: clear ready (so ticket head+cap can reuse it) and advance
     # head (release) as the consumer's linearization point.
     storeU64Release(base, so + SlotOffReady, 0)
-    storeU64Release(base, HdrOffHead, head + 1)
+    storeU64Release(base, ringBase + RingOffHead, head + 1)
     drGot
+
+  # --- segment-owning ShmRing (ringBase = 0) -------------------------------
+
+  proc tryPush*(r: var ShmRing; blob: openArray[byte]): PushResult =
+    ## Lock-free multi-producer push. Reserves a ticket by CAS-bumping `tail`,
+    ## writes `blob` (u32 length prefix + bytes) into the reserved slot, and
+    ## publishes via a release-store of `ready = ticket+1`. Bounded: a full ring
+    ## bumps the atomic `dropped` counter and returns `prDropped` (SIGNALLED,
+    ## never silent, never overwriting an unread slot). A blob longer than the
+    ## segment's `maxBlobLen` returns `prOversize` with the ring unchanged.
+    if not r.seg.isValid:
+      return prOversize
+    pushBlob(r.seg.base, HdrOffHead, r.seg.capacity, r.seg.maxBlobLen, blob)
+
+  proc tryDrainOne*(r: var ShmRing; outBuf: var openArray[byte];
+      outLen: var int): DrainResult =
+    ## SINGLE-consumer non-blocking drain of the next ready ticket. Returns
+    ## `drEmpty` when the head slot is not yet published (empty ring or a
+    ## producer mid-write — a torn/unpublished slot is SKIPPED, never read).
+    ## Returns `drOverflowBuf` (ring unchanged) when `outBuf` is smaller than
+    ## the stored blob. On `drGot`, `outLen` bytes were copied into `outBuf`.
+    outLen = 0
+    if not r.seg.isValid:
+      return drEmpty
+    drainBlob(r.seg.base, HdrOffHead, r.seg.capacity, r.seg.maxBlobLen, outBuf, outLen)
 
   proc droppedCount*(r: ShmRing): uint64 {.inline.} =
     ## Number of SIGNALLED ring-full drops.
@@ -170,8 +185,75 @@ when shmSegmentSupported:
     if not r.seg.isValid: return 0
     loadU64Acquire(r.seg.base, HdrOffTail) - loadU64Acquire(r.seg.base, HdrOffHead)
 
+  # --- EmbeddedRing: a ring living inside a caller-owned mmap region --------
+  #
+  # For a consumer that already owns a shared region (its own header, other
+  # fields) and wants the SAME MPSC ring as a SUB-STRUCTURE at a fixed byte
+  # offset — e.g. reprobuild's action-cache control region, which carries a
+  # boot-guarded header, a reader-epoch table AND the submission ring in one
+  # `.ctl` mapping. The caller owns the mapping lifecycle + header/boot guard;
+  # this view supplies only the ring coordination, using the SAME ring header
+  # (head/tail/dropped) + slot layout as the segment-owning ring, so there is
+  # one and only one MPSC implementation.
+
+  type
+    EmbeddedRing* = object
+      base*: ShmBase   ## caller-owned mapped base (nil ⇒ unavailable)
+      ringBase*: int   ## byte offset of the ring header within the region
+      cap*: int        ## ring capacity (power of two)
+      maxBlobLen*: int ## per-slot blob capacity
+
+  proc initEmbeddedRing*(base: ShmBase; ringBase, cap, maxBlobLen: int):
+      EmbeddedRing {.inline.} =
+    ## Build a view over the ring embedded at `ringBase` in the caller-owned
+    ## region `base`. The caller supplies the geometry (there is no segment
+    ## header to read it from) and owns the region's create/attach/boot guard.
+    EmbeddedRing(base: base, ringBase: ringBase, cap: cap, maxBlobLen: maxBlobLen)
+
+  proc resetEmbeddedRing*(r: EmbeddedRing) =
+    ## Zero the ring header (head/tail/dropped) on fresh-region init. Slot
+    ## `ready` fields are already zero in a freshly zero-filled region.
+    if r.base.isNil: return
+    storeU64Relaxed(r.base, r.ringBase + RingOffHead, 0)
+    storeU64Relaxed(r.base, r.ringBase + RingOffTail, 0)
+    storeU64Relaxed(r.base, r.ringBase + RingOffDropped, 0)
+
+  func isValid*(r: EmbeddedRing): bool {.inline.} = not r.base.isNil
+  func capacity*(r: EmbeddedRing): int {.inline.} = r.cap
+  func maxBlobLen*(r: EmbeddedRing): int {.inline.} = r.maxBlobLen
+
+  proc tryPush*(r: EmbeddedRing; blob: openArray[byte]): PushResult =
+    ## Same multi-producer push as `ShmRing.tryPush`, over the embedded ring.
+    if r.base.isNil:
+      return prOversize
+    pushBlob(r.base, r.ringBase, r.cap, r.maxBlobLen, blob)
+
+  proc tryDrainOne*(r: EmbeddedRing; outBuf: var openArray[byte];
+      outLen: var int): DrainResult =
+    ## Same single-consumer drain as `ShmRing.tryDrainOne`, over the embedded ring.
+    outLen = 0
+    if r.base.isNil:
+      return drEmpty
+    drainBlob(r.base, r.ringBase, r.cap, r.maxBlobLen, outBuf, outLen)
+
+  proc droppedCount*(r: EmbeddedRing): uint64 {.inline.} =
+    if r.base.isNil: return 0
+    loadU64Acquire(r.base, r.ringBase + RingOffDropped)
+
+  proc pendingCount*(r: EmbeddedRing): uint64 {.inline.} =
+    if r.base.isNil: return 0
+    loadU64Acquire(r.base, r.ringBase + RingOffTail) -
+      loadU64Acquire(r.base, r.ringBase + RingOffHead)
+
 else:
   # Non-POSIX: compiles but every op reports empty/unavailable.
+  type
+    EmbeddedRing* = object
+      base*: ShmBase
+      ringBase*: int
+      cap*: int
+      maxBlobLen*: int
+
   proc tryPush*(r: var ShmRing; blob: openArray[byte]): PushResult = prOversize
   proc tryDrainOne*(r: var ShmRing; outBuf: var openArray[byte];
       outLen: var int): DrainResult =
@@ -179,3 +261,18 @@ else:
     drEmpty
   proc droppedCount*(r: ShmRing): uint64 = 0
   proc pendingCount*(r: ShmRing): uint64 = 0
+
+  proc initEmbeddedRing*(base: ShmBase; ringBase, cap, maxBlobLen: int):
+      EmbeddedRing =
+    EmbeddedRing(base: base, ringBase: ringBase, cap: cap, maxBlobLen: maxBlobLen)
+  proc resetEmbeddedRing*(r: EmbeddedRing) = discard
+  func isValid*(r: EmbeddedRing): bool = not r.base.isNil
+  func capacity*(r: EmbeddedRing): int = r.cap
+  func maxBlobLen*(r: EmbeddedRing): int = r.maxBlobLen
+  proc tryPush*(r: EmbeddedRing; blob: openArray[byte]): PushResult = prOversize
+  proc tryDrainOne*(r: EmbeddedRing; outBuf: var openArray[byte];
+      outLen: var int): DrainResult =
+    outLen = 0
+    drEmpty
+  proc droppedCount*(r: EmbeddedRing): uint64 = 0
+  proc pendingCount*(r: EmbeddedRing): uint64 = 0

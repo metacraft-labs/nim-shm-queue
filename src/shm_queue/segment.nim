@@ -56,6 +56,25 @@ const
   HdrOffDropped* = HdrOffTail + 8                 # u64 (drop-on-full count)
   SegHeaderSize* = align8(HdrOffDropped + 8)
 
+# --- RING HEADER (relocatable sub-block: head/tail/dropped) -----------------
+#
+# The ring's own coordination state is a self-contained {head, tail, dropped}
+# block, RELATIVE to a `ringBase` byte offset. In the segment-owning layout it
+# sits at `HdrOffHead` inside the segment header (`HdrOffHead == ringBase +
+# RingOffHead`, ringBase = HdrOffHead); an EMBEDDED ring (a caller-owned region,
+# e.g. reprobuild's action-cache control region) places this same block at
+# whatever `ringBase` the caller chooses. Both reuse the SAME ring-header + slot
+# layout, so exactly one MPSC implementation exists.
+const
+  RingOffHead* = 0                   # u64 (consumer-owned)
+  RingOffTail* = RingOffHead + 8     # u64 (producers CAS)
+  RingOffDropped* = RingOffTail + 8  # u64 (drop-on-full count)
+
+func ringSlotsBaseOffset*(): int {.inline.} =
+  ## Byte offset (relative to `ringBase`) of the first slot: the 24-byte ring
+  ## header rounded up to 8-byte alignment.
+  align8(RingOffDropped + 8)
+
 # One slot: {ready(u64 publication ticket), blobLen(u32), pad(u32),
 #            blobBytes[maxBlobLen]}. `ready == 0` means never-written;
 # `ready == ticket+1` means the blob for `ticket` is published.
@@ -68,6 +87,18 @@ const
 func slotStrideFor*(maxBlobLen: int): int {.inline.} =
   ## Byte stride of one ring slot for a given `maxBlobLen`.
   align8(SlotOffBlob + maxBlobLen)
+
+func embeddedRingHeaderSize*(): int {.inline.} =
+  ## Byte size of an embedded ring's header (head/tail/dropped), which precedes
+  ## the slot array. A caller lays its region out as
+  ## `... | ringHeader | slot[cap] | ...`. (Const-usable geometry, so a consumer
+  ## like reprobuild's control region can size itself at compile time.)
+  ringSlotsBaseOffset()
+
+func embeddedRingSize*(cap, maxBlobLen: int): int {.inline.} =
+  ## Total byte span of an embedded ring (header + `cap` slots) for a caller
+  ## computing its region size / the offset of whatever follows the ring.
+  ringSlotsBaseOffset() + cap * slotStrideFor(maxBlobLen)
 
 func segRegionSize*(capacity, maxBlobLen: int): int {.inline.} =
   ## Page-rounded byte size of a ring segment with `capacity` slots.

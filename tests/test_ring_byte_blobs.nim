@@ -491,3 +491,81 @@ suite "multi-process producers (fork)":
     # And the ring is bounded: we can never have drained more than attempts.
     check drainedCount <= totalAttempts
     r.detach()
+
+# --- EmbeddedRing: a ring living inside a caller-owned region ----------------
+#
+# Exercises the `EmbeddedRing` view (added for reprobuild's action-cache control
+# region, which carries its own header + reader-epoch table AND the submission
+# ring in one mapping). We hand-build a caller-owned region as
+# `[headerGuard | ringHeader | slot[cap] | trailerGuard]`, init the embedded
+# ring, and assert (a) push/drain/FIFO/drop parity with the owned ring and
+# (b) the caller's bytes BEFORE and AFTER the ring are never touched by the ring.
+
+when shmSegmentSupported:
+  import std/posix as posix2
+
+  suite "EmbeddedRing over a caller-owned region":
+    test "push/drain/FIFO/drop parity + caller bytes untouched":
+      const
+        cap = 8
+        maxBlob = 48
+        guardHead = 64        # caller-owned header bytes BEFORE the ring
+        guardTail = 32        # caller-owned trailer bytes AFTER the ring
+      let ringBase = guardHead
+      let ringSpan = embeddedRingSize(cap, maxBlob)
+      let regionSize = ringBase + ringSpan + guardTail
+
+      # A plain anonymous shared mapping stands in for the caller's region.
+      let p = mmap(nil, regionSize, PROT_READ or PROT_WRITE,
+        MAP_SHARED or MAP_ANONYMOUS, -1, 0)
+      check p != MAP_FAILED
+      let base = cast[ptr UncheckedArray[byte]](p)
+      # Stamp recognizable sentinel bytes into the caller-owned guard regions.
+      for i in 0 ..< guardHead: base[i] = byte(0xA0 + (i and 0x0F))
+      for i in 0 ..< guardTail:
+        base[ringBase + ringSpan + i] = byte(0xB0 + (i and 0x0F))
+
+      var er = initEmbeddedRing(base, ringBase, cap, maxBlob)
+      resetEmbeddedRing(er)
+      check er.isValid
+      check er.capacity == cap
+      check er.maxBlobLen == maxBlob
+
+      var outBuf = newSeq[byte](maxBlob)
+
+      # Roundtrip at boundary sizes + oversize reject.
+      for sz in [0, 1, maxBlob]:
+        let b = blobOf(sz, byte(sz))
+        check er.tryPush(b) == prPushed
+        var outLen = 0
+        check er.tryDrainOne(outBuf, outLen) == drGot
+        check outLen == sz
+        check outBuf[0 ..< sz] == b
+      check er.tryPush(blobOf(maxBlob + 1)) == prOversize
+
+      # FIFO across a wraparound past 2*cap.
+      var expect = 0
+      for round in 0 ..< 3 * cap:
+        check er.tryPush(blobOf(4, byte(round))) == prPushed
+        var outLen = 0
+        check er.tryDrainOne(outBuf, outLen) == drGot
+        check outBuf[0 ..< 4] == blobOf(4, byte(round))
+
+      # Fill without draining: overflow is a SIGNALLED drop.
+      for i in 0 ..< cap:
+        check er.tryPush(blobOf(4, byte(i))) == prPushed
+      check er.pendingCount() == uint64(cap)
+      var drops = 0
+      for i in 0 ..< 5:
+        if er.tryPush(blobOf(4)) == prDropped: inc drops
+      check drops == 5
+      check er.droppedCount() == 5'u64
+
+      # The caller-owned guard bytes are pristine — the ring never wrote outside
+      # `[ringBase, ringBase + ringSpan)`.
+      for i in 0 ..< guardHead:
+        check base[i] == byte(0xA0 + (i and 0x0F))
+      for i in 0 ..< guardTail:
+        check base[ringBase + ringSpan + i] == byte(0xB0 + (i and 0x0F))
+
+      discard munmap(p, regionSize)
