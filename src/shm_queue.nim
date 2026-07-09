@@ -12,5 +12,5 @@
 ##
 ## Layer 3 (consumers) live in their own repos (io-mon dep queue,
 ## reprobuild action-cache submission ring) and sit on Layer 2.
-import shm_queue/ring
-export ring
+import shm_queue/[ring, segment]
+export ring, segment
