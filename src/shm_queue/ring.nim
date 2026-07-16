@@ -39,15 +39,26 @@ export segment.ShmSegment, segment.isValid, segment.bootId,
   segment.embeddedRingHeaderSize
 
 type
-  ShmRing* = object
-    ## A view over a byte-blob ring backed by an `ShmSegment`. Copy semantics
-    ## follow the segment (an owned mapping); use `detach` to release.
+  OverflowPolicy* = enum
+    ## Compile-time overflow discipline. Selected per instantiation so each ring
+    ## is monomorphized to branch-free code (no runtime policy check on the hot
+    ## path). See `Shm-Queue-Library.md` / `io-mon-Lossless-Event-Capture.md` §4.1.
+    opDropSignalled ## action cache: on full bump `dropped`, return `prDropped`.
+    opBlockProducer ## io-mon deps: on full WAIT for a slot; never drop.
+
+  ShmRing*[policy: static OverflowPolicy = opDropSignalled] = object
+    ## A view over a byte-blob ring backed by an `ShmSegment`, parameterised by
+    ## its overflow `policy` (default `opDropSignalled`, so a bare `ShmRing` is
+    ## the historical drop-on-full ring). Copy semantics follow the segment (an
+    ## owned mapping); use `detach` to release.
     seg*: ShmSegment
 
   PushResult* = enum
-    prPushed   ## the blob was reserved + published
-    prDropped  ## ring full: SIGNALLED drop (the `dropped` counter bumped)
-    prOversize ## blob longer than the segment's `maxBlobLen`: ring unchanged
+    prPushed       ## the blob was reserved + published
+    prDropped      ## ring full: SIGNALLED drop (`opDropSignalled` only)
+    prOversize     ## blob longer than the segment's `maxBlobLen`: ring unchanged
+    prConsumerGone ## `opBlockProducer` only: waited, but the consumer is dead/
+                   ## absent (liveness token) — fail fast, never hang (LF-4)
 
   DrainResult* = enum
     drEmpty       ## nothing to drain (empty ring, or head slot not yet published)
@@ -58,21 +69,37 @@ func capacity*(r: ShmRing): int {.inline.} = r.seg.capacity
 func maxBlobLen*(r: ShmRing): int {.inline.} = r.seg.maxBlobLen
 func isValid*(r: ShmRing): bool {.inline.} = r.seg.isValid
 
-proc createRing*(path: string; cap, maxBlobLen: int; boot: uint64): ShmRing =
-  ## Create a fresh, zero-filled ring segment of `cap` slots, each holding a
-  ## blob of up to `maxBlobLen` bytes, stamped with `boot`. `cap` MUST be a
-  ## power of two (so `ticket mod cap` is a mask) and positive; `maxBlobLen`
+proc createRing*(path: string; cap, maxBlobLen: int;
+    boot: uint64): ShmRing[opDropSignalled] =
+  ## Create a fresh, zero-filled DROP-ON-FULL ring segment of `cap` slots, each
+  ## holding a blob of up to `maxBlobLen` bytes, stamped with `boot`. `cap` MUST
+  ## be a power of two (so `ticket mod cap` is a mask) and positive; `maxBlobLen`
   ## MUST be non-negative. Returns an invalid ring on a bad geometry or on any
   ## create failure.
   if cap <= 0 or (cap and (cap - 1)) != 0 or maxBlobLen < 0:
-    return ShmRing() # invalid: caller checks isValid
-  ShmRing(seg: createSegment(path, cap, maxBlobLen, boot))
+    return ShmRing[opDropSignalled]() # invalid: caller checks isValid
+  ShmRing[opDropSignalled](seg: createSegment(path, cap, maxBlobLen, boot))
 
-proc attachRing*(path: string): ShmRing =
-  ## Attach to an existing ring segment. Returns an invalid ring when the file
-  ## is missing / wrong-sized / stale (wrong magic / formatVersion /
-  ## creatorBootId — the boot guard). The geometry is read from the header.
-  ShmRing(seg: attachSegment(path))
+proc attachRing*(path: string): ShmRing[opDropSignalled] =
+  ## Attach to an existing DROP-ON-FULL ring segment. Returns an invalid ring
+  ## when the file is missing / wrong-sized / stale (wrong magic / formatVersion
+  ## / creatorBootId — the boot guard). The geometry is read from the header.
+  ShmRing[opDropSignalled](seg: attachSegment(path))
+
+proc createBlockingRing*(path: string; cap, maxBlobLen: int;
+    boot: uint64): ShmRing[opBlockProducer] =
+  ## Create a fresh LOSSLESS (block-on-full) ring segment. Same on-segment format
+  ## as `createRing`; only the producer's overflow discipline differs (it waits
+  ## for a slot rather than dropping). The consumer should call
+  ## `registerConsumer` before spawning producers so a waiting producer can
+  ## detect a dead consumer (LF-4).
+  if cap <= 0 or (cap and (cap - 1)) != 0 or maxBlobLen < 0:
+    return ShmRing[opBlockProducer]()
+  ShmRing[opBlockProducer](seg: createSegment(path, cap, maxBlobLen, boot))
+
+proc attachBlockingRing*(path: string): ShmRing[opBlockProducer] =
+  ## Attach to an existing block-on-full ring segment (producer side).
+  ShmRing[opBlockProducer](seg: attachSegment(path))
 
 proc detach*(r: var ShmRing) =
   detach(r.seg)
@@ -150,30 +177,119 @@ when shmSegmentSupported:
     storeU64Release(base, ringBase + RingOffHead, head + 1)
     drGot
 
-  # --- segment-owning ShmRing (ringBase = 0) -------------------------------
+  # --- block-producer (opBlockProducer) push -------------------------------
+  #
+  # Bounded-spin → futex-wait on `head` with a consumer-liveness re-check, so a
+  # full ring makes the producer WAIT for a slot (never drop) while the consumer
+  # is alive, and fail fast (`prConsumerGone`) when it is not. Only used by the
+  # segment-owning `ShmRing[opBlockProducer]` (embedded rings stay drop-only).
 
-  proc tryPush*(r: var ShmRing; blob: openArray[byte]): PushResult =
+  const
+    BlockSpinLimit* = 256
+      ## CAS-reservation spin attempts before parking on the futex. The common
+      ## case (consumer keeps up) resolves here with no syscall.
+    BlockFutexTimeoutNs* = 20_000_000'i64
+      ## Futex wait slice (20 ms). A killed consumer that can never wake us is
+      ## bounded by this: on timeout the producer re-probes liveness and, if the
+      ## consumer is dead, returns `prConsumerGone`.
+
+  proc pushBlobBlocking(base: ShmBase; cap, maxBlobLen: int;
+      blob: openArray[byte]): PushResult =
+    if blob.len > maxBlobLen:
+      return prOversize
+    var tail = loadU64Acquire(base, HdrOffTail)
+    var spins = 0
+    while true:
+      let head = loadU64Acquire(base, HdrOffHead)
+      if tail - head >= uint64(cap):
+        # Ring full. Never drop: wait for the consumer to free a slot, but only
+        # while it is alive.
+        if not consumerAlive(base):
+          return prConsumerGone
+        if spins < BlockSpinLimit:
+          inc spins
+          tail = loadU64Acquire(base, HdrOffTail)
+          continue
+        # Park. Register as a waiter (so the consumer knows to wake us), then
+        # re-check under the registration to avoid a lost wakeup.
+        discard fetchAddU64(base, HdrOffWaiters, 1)
+        let head2 = loadU64Acquire(base, HdrOffHead)
+        let tail2 = loadU64Acquire(base, HdrOffTail)
+        if tail2 - head2 < uint64(cap):
+          discard fetchSubU64(base, HdrOffWaiters, 1)
+          tail = tail2
+          spins = 0
+          continue
+        if not consumerAlive(base):
+          discard fetchSubU64(base, HdrOffWaiters, 1)
+          return prConsumerGone
+        futexWaitHead(base, uint32(head2 and 0xFFFF_FFFF'u64), BlockFutexTimeoutNs)
+        discard fetchSubU64(base, HdrOffWaiters, 1)
+        spins = 0
+        tail = loadU64Acquire(base, HdrOffTail)
+        continue
+      # Not full: reserve ticket `tail`.
+      if casU64(base, HdrOffTail, tail, tail + 1):
+        break
+    # We own ticket `tail`; write the blob then publish via release-store.
+    let so = slotOffAt(HdrOffHead, cap, maxBlobLen, tail)
+    if blob.len > 0:
+      copyMem(addr base[so + SlotOffBlob], unsafeAddr blob[0], blob.len)
+    storeU32Release(base, so + SlotOffBlobLen, uint32(blob.len))
+    storeU64Release(base, so + SlotOffReady, tail + 1)
+    prPushed
+
+  # --- segment-owning ShmRing (ringBase = HdrOffHead) ----------------------
+
+  proc tryPush*[p: static OverflowPolicy](r: var ShmRing[p];
+      blob: openArray[byte]): PushResult =
     ## Lock-free multi-producer push. Reserves a ticket by CAS-bumping `tail`,
     ## writes `blob` (u32 length prefix + bytes) into the reserved slot, and
-    ## publishes via a release-store of `ready = ticket+1`. Bounded: a full ring
-    ## bumps the atomic `dropped` counter and returns `prDropped` (SIGNALLED,
-    ## never silent, never overwriting an unread slot). A blob longer than the
+    ## publishes via a release-store of `ready = ticket+1`. A blob longer than the
     ## segment's `maxBlobLen` returns `prOversize` with the ring unchanged.
+    ##
+    ## `opDropSignalled`: a full ring bumps the atomic `dropped` counter and
+    ## returns `prDropped` (SIGNALLED, never silent, never overwriting an unread
+    ## slot). `opBlockProducer`: a full ring makes the producer WAIT for a slot
+    ## (never drop) while the consumer is alive, returning `prConsumerGone` if
+    ## the consumer is dead/absent (never a hang — LF-4).
     if not r.seg.isValid:
       return prOversize
-    pushBlob(r.seg.base, HdrOffHead, r.seg.capacity, r.seg.maxBlobLen, blob)
+    when p == opDropSignalled:
+      pushBlob(r.seg.base, HdrOffHead, r.seg.capacity, r.seg.maxBlobLen, blob)
+    else:
+      pushBlobBlocking(r.seg.base, r.seg.capacity, r.seg.maxBlobLen, blob)
 
-  proc tryDrainOne*(r: var ShmRing; outBuf: var openArray[byte];
-      outLen: var int): DrainResult =
+  proc tryDrainOne*[p: static OverflowPolicy](r: var ShmRing[p];
+      outBuf: var openArray[byte]; outLen: var int): DrainResult =
     ## SINGLE-consumer non-blocking drain of the next ready ticket. Returns
     ## `drEmpty` when the head slot is not yet published (empty ring or a
     ## producer mid-write — a torn/unpublished slot is SKIPPED, never read).
     ## Returns `drOverflowBuf` (ring unchanged) when `outBuf` is smaller than
     ## the stored blob. On `drGot`, `outLen` bytes were copied into `outBuf`.
+    ##
+    ## For `opBlockProducer`, after freeing a slot the consumer wakes any waiting
+    ## producers (gated by the `waiters` atomic, so the uncontended path is one
+    ## relaxed load with no syscall).
     outLen = 0
     if not r.seg.isValid:
       return drEmpty
-    drainBlob(r.seg.base, HdrOffHead, r.seg.capacity, r.seg.maxBlobLen, outBuf, outLen)
+    let dr = drainBlob(r.seg.base, HdrOffHead, r.seg.capacity,
+      r.seg.maxBlobLen, outBuf, outLen)
+    when p == opBlockProducer:
+      if dr == drGot and loadU64Relaxed(r.seg.base, HdrOffWaiters) > 0:
+        futexWakeHead(r.seg.base)
+    dr
+
+  proc registerConsumer*(r: var ShmRing[opBlockProducer]) =
+    ## Consumer side: publish this process as the live drainer (LF-4). Call once
+    ## before producers may start waiting.
+    if r.seg.isValid: registerConsumer(r.seg.base)
+
+  proc markConsumerGone*(r: var ShmRing[opBlockProducer]) =
+    ## Consumer side: announce a clean shutdown and wake any waiters so they see
+    ## `prConsumerGone` immediately instead of after the futex timeout.
+    if r.seg.isValid: deregisterConsumer(r.seg.base)
 
   proc droppedCount*(r: ShmRing): uint64 {.inline.} =
     ## Number of SIGNALLED ring-full drops.
@@ -254,6 +370,9 @@ else:
       cap*: int
       maxBlobLen*: int
 
+  const
+    BlockSpinLimit* = 256
+    BlockFutexTimeoutNs* = 20_000_000'i64
   proc tryPush*(r: var ShmRing; blob: openArray[byte]): PushResult = prOversize
   proc tryDrainOne*(r: var ShmRing; outBuf: var openArray[byte];
       outLen: var int): DrainResult =
@@ -261,6 +380,8 @@ else:
     drEmpty
   proc droppedCount*(r: ShmRing): uint64 = 0
   proc pendingCount*(r: ShmRing): uint64 = 0
+  proc registerConsumer*(r: var ShmRing[opBlockProducer]) = discard
+  proc markConsumerGone*(r: var ShmRing[opBlockProducer]) = discard
 
   proc initEmbeddedRing*(base: ShmBase; ringBase, cap, maxBlobLen: int):
       EmbeddedRing =

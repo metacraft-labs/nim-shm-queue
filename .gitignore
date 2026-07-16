@@ -10,6 +10,7 @@ test-logs/
 
 # Compiled test / benchmark binaries (built next to their .nim sources).
 tests/test_ring_byte_blobs
+tests/test_ring_block_producer
 tests/test_typed_queue_nim_spectrum
 benchmarks/bench_ring_throughput
 benchmarks/bench_typed_queue

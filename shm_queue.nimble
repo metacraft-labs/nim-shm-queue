@@ -31,6 +31,9 @@ task test, "Run the layer-agnostic test suite":
   # Layer 1 (SHM-QUEUE-L1): the byte-blob ring coordination corner cases.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
     "tests/test_ring_byte_blobs.nim"
+  # Layer 1 (SHM-QUEUE-L1): the opBlockProducer lossless overflow policy.
+  exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
+    "tests/test_ring_block_producer.nim"
   # Layer 2 (SHM-QUEUE-L2): the typed (T, Format) spectrum suite.
   if fileExists("tests/test_typed_queue_nim_spectrum.nim"):
     exec "nim c -r --hints:off --threads:on --warning:BareExcept:off" &

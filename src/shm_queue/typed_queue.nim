@@ -41,7 +41,10 @@ type
     ## mapping); use `detach` to release. The scratch structures are per-queue and
     ## MUST NOT be shared across threads — each producer/consumer holds its own
     ## `TypedShmQueue` (as it holds its own `ShmRing` view), same as Layer 1.
-    ring*: ShmRing
+    ## Layer 2 is drop-on-full (the typed submission/telemetry queue), so it pins
+    ## the ring to `opDropSignalled`; the lossless `opBlockProducer` policy is a
+    ## Layer-1 choice callers make directly with `createBlockingRing`.
+    ring*: ShmRing[opDropSignalled]
     encStream: OutputStream   ## reused producer-side encode stream (pages recycled)
     decBuf: seq[byte]         ## consumer-side scratch for the drained blob
 

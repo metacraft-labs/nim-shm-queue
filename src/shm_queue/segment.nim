@@ -35,8 +35,12 @@ func align4k*(n: int): int = (n + 4095) and not 4095
 const
   ShmRingMagic* = 0x5147_4D48_53_00_01'u64
     ## Fixed magic identifying an shm_queue Layer-1 ring segment.
-  ShmRingFormatVersion* = 1'u32
-    ## Bumped on any change to the on-segment layout below.
+  ShmRingFormatVersion* = 2'u32
+    ## Bumped on any change to the on-segment layout below. v2 adds the
+    ## block-producer coordination block (waiters gate + consumer-liveness
+    ## token) between the geometry fields and the ring header; the ring header
+    ## (head/tail/dropped) and slot layout are unchanged relative to `ringBase`,
+    ## so `opDropSignalled` rings are byte-for-byte compatible in behaviour.
 
 # --- fixed segment-header byte layout (offset-only, base-independent) -------
 #
@@ -51,7 +55,16 @@ const
   HdrOffCreatorBootId* = HdrOffFlags + 4          # u64
   HdrOffCapacity* = HdrOffCreatorBootId + 8       # u64
   HdrOffMaxBlobLen* = HdrOffCapacity + 8          # u64
-  HdrOffHead* = HdrOffMaxBlobLen + 8              # u64 (consumer-owned)
+  # --- block-producer coordination (v2; inert for opDropSignalled) ----------
+  # These sit BEFORE the ring header so the ring-header/slot layout (relative to
+  # `ringBase = HdrOffHead`) is unchanged. `opBlockProducer` uses them for a
+  # futex-gated wait with a consumer-liveness token; `opDropSignalled` never
+  # touches them (they stay zero — the drain path only pays one relaxed load).
+  HdrOffWaiters* = HdrOffMaxBlobLen + 8           # u64 (waiting-producer gate)
+  HdrOffConsumerPid* = HdrOffWaiters + 8          # u64 (consumer pid, 0=none)
+  HdrOffConsumerBoot* = HdrOffConsumerPid + 8     # u64 (boot at registration)
+  HdrOffConsumerAlive* = HdrOffConsumerBoot + 8   # u64 (1=alive, 0=deregistered)
+  HdrOffHead* = HdrOffConsumerAlive + 8          # u64 (consumer-owned)
   HdrOffTail* = HdrOffHead + 8                    # u64 (producers CAS)
   HdrOffDropped* = HdrOffTail + 8                 # u64 (drop-on-full count)
   SegHeaderSize* = align8(HdrOffDropped + 8)
@@ -158,10 +171,92 @@ when shmSegmentSupported:
       false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE)
   proc fetchAddU64*(base: ShmBase; off: int; delta: uint64): uint64 {.inline.} =
     atomicAddFetch(atField[uint64](base, off), delta, ATOMIC_SEQ_CST)
+  proc fetchSubU64*(base: ShmBase; off: int; delta: uint64): uint64 {.inline.} =
+    atomicSubFetch(atField[uint64](base, off), delta, ATOMIC_SEQ_CST)
+  proc loadU32Relaxed*(base: ShmBase; off: int): uint32 {.inline.} =
+    atomicLoadN(atField[uint32](base, off), ATOMIC_RELAXED)
   proc loadU32Acquire*(base: ShmBase; off: int): uint32 {.inline.} =
     atomicLoadN(atField[uint32](base, off), ATOMIC_ACQUIRE)
   proc storeU32Release*(base: ShmBase; off: int; v: uint32) {.inline.} =
     atomicStoreN(atField[uint32](base, off), v, ATOMIC_RELEASE)
+
+  # --- futex-gated wait (opBlockProducer) ------------------------------------
+  #
+  # A blocking producer that finds the ring full waits on the `head` word so the
+  # consumer, on advancing `head`, wakes it. Linux uses `futex`; other POSIX
+  # hosts fall back to a short `nanosleep` poll (still liveness-checked, just
+  # without the wakeup syscall). The futex compares a 32-bit word: we wait on the
+  # LOW 32 bits of `head` (little-endian hosts only — asserted below), which the
+  # consumer bumps on every drain, so a wait can never miss a real advance for
+  # more than one 2^32 wrap (astronomically rare and bounded by the timeout).
+  when defined(linux):
+    when cpuEndian != littleEndian:
+      {.error: "opBlockProducer futex assumes a little-endian host".}
+    var SYS_futexNo {.importc: "SYS_futex", header: "<sys/syscall.h>".}: clong
+    proc rawSyscall(n: clong): clong {.
+      importc: "syscall", header: "<unistd.h>", varargs, discardable.}
+    const
+      FUTEX_WAIT_PRIVATE = 128
+      FUTEX_WAKE_PRIVATE = 129
+
+    proc futexWaitHead*(base: ShmBase; expectedLow32: uint32;
+        timeoutNs: int64) {.inline.} =
+      ## Sleep until the low 32 bits of `head` differ from `expectedLow32`, a
+      ## wake arrives, or `timeoutNs` elapses. A spurious/timeout wake is fine —
+      ## the caller re-checks the ring + consumer liveness.
+      var ts: Timespec
+      ts.tv_sec = posix.Time(timeoutNs div 1_000_000_000)
+      ts.tv_nsec = clong(timeoutNs mod 1_000_000_000)
+      discard rawSyscall(SYS_futexNo, addr base[HdrOffHead],
+        cint(FUTEX_WAIT_PRIVATE), cint(expectedLow32), addr ts)
+
+    proc futexWakeHead*(base: ShmBase) {.inline.} =
+      ## Wake every producer waiting on `head`.
+      discard rawSyscall(SYS_futexNo, addr base[HdrOffHead],
+        cint(FUTEX_WAKE_PRIVATE), cint(high(int32)))
+  else:
+    proc futexWaitHead*(base: ShmBase; expectedLow32: uint32;
+        timeoutNs: int64) {.inline.} =
+      var ts = Timespec(tv_sec: posix.Time(timeoutNs div 1_000_000_000),
+        tv_nsec: clong(timeoutNs mod 1_000_000_000))
+      var rem: Timespec
+      discard nanosleep(ts, rem)
+    proc futexWakeHead*(base: ShmBase) {.inline.} = discard
+
+  # --- consumer-liveness token -----------------------------------------------
+  #
+  # A blocking producer must never wedge a monitored process against a dead or
+  # absent consumer (LF-4). The consumer registers its (pid, boot) and an `alive`
+  # flag; a waiting producer re-checks on every wake. Liveness is boot-guarded
+  # (a pid from a previous boot is meaningless) and probed with `kill(pid, 0)`.
+
+  proc registerConsumer*(base: ShmBase) =
+    ## Consumer side: publish this process as the live drainer. Call once before
+    ## producers may start waiting.
+    storeU64Relaxed(base, HdrOffConsumerBoot, bootId())
+    storeU64Relaxed(base, HdrOffConsumerPid, uint64(getpid()))
+    storeU64Release(base, HdrOffConsumerAlive, 1)
+
+  proc deregisterConsumer*(base: ShmBase) =
+    ## Consumer side: mark gone (clean shutdown) and wake any waiters so they
+    ## observe `prConsumerGone` promptly rather than waiting for the timeout.
+    storeU64Release(base, HdrOffConsumerAlive, 0)
+    futexWakeHead(base)
+
+  proc consumerAlive*(base: ShmBase): bool =
+    ## Producer side: is the registered consumer alive on THIS boot? An
+    ## unregistered consumer (pid 0) is treated as alive — the consumer may not
+    ## have registered yet — so callers that need strict liveness must register.
+    let pid = loadU64Acquire(base, HdrOffConsumerPid)
+    if pid == 0:
+      return true
+    if loadU64Relaxed(base, HdrOffConsumerBoot) != bootId():
+      return false # registered on a previous boot ⇒ stale ⇒ gone
+    if loadU64Acquire(base, HdrOffConsumerAlive) == 0:
+      return false # explicit clean deregister
+    if kill(Pid(pid), cint(0)) == 0:
+      return true
+    return errno != ESRCH # ESRCH ⇒ pid dead; EPERM ⇒ exists (alive)
 
   proc mapFd(fd: cint; size: int): ShmBase =
     let p = mmap(nil, size, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0)
@@ -178,6 +273,10 @@ when shmSegmentSupported:
     storeU64Relaxed(base, HdrOffHead, 0)
     storeU64Relaxed(base, HdrOffTail, 0)
     storeU64Relaxed(base, HdrOffDropped, 0)
+    storeU64Relaxed(base, HdrOffWaiters, 0)
+    storeU64Relaxed(base, HdrOffConsumerPid, 0)
+    storeU64Relaxed(base, HdrOffConsumerBoot, 0)
+    storeU64Relaxed(base, HdrOffConsumerAlive, 0)
     storeU32Release(base, HdrOffFormatVersion, ShmRingFormatVersion)
     storeU64Relaxed(base, HdrOffFlags, 0)
     storeU64Relaxed(base, HdrOffCapacity, uint64(capacity))
