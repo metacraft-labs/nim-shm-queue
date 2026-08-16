@@ -15,6 +15,8 @@
 ##     already supplies `--path:src --threads:on`; the recipes re-state
 ##     `--path:src` explicitly for the hermetic (`--skipParentCfg`) case.
 
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
 alias t := test
 alias fmt := format
 
