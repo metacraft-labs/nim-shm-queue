@@ -68,7 +68,7 @@ jobs:
         # (self-only — nim-shm-queue is a leaf library with no `uses:`
         # sibling edges) at the workspace-lock-pinned revisions before
         # materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
           gh-token: ${{ steps.ci_token.outputs.token }}
