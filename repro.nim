@@ -75,6 +75,7 @@
 ## required for uses declarations".
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 
 # ``ct_test_nim_unittest`` supplies the ``buildNimUnittest.build(...)``
 # typed-tool used by every BUILD edge below, and the
@@ -153,6 +154,9 @@ package shm_queue:
   library shm_queue
 
   devEnv:
+    # Reuse the workspace toolchain until native provisioning replaces the flake.
+    when not defined(windows):
+      useFlakeDevShell("..")
     task "bump-version", command = "just bump-version", description = "Bump version number (version.txt)"
 
   build:
