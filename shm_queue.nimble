@@ -34,6 +34,8 @@ task test, "Run the layer-agnostic test suite":
   # Layer 1 (SHM-QUEUE-L1): the opBlockProducer lossless overflow policy.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
     "tests/test_ring_block_producer.nim"
+  # Every Nim compile in this checkout keeps its nimcache in the checkout.
+  exec "nim c -r --hints:off tests/test_nimcache_is_worktree_local.nim"
   # Layer 2 (SHM-QUEUE-L2): the typed (T, Format) spectrum suite.
   if fileExists("tests/test_typed_queue_nim_spectrum.nim"):
     exec "nim c -r --hints:off --threads:on --warning:BareExcept:off" &
