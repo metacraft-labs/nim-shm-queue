@@ -14,6 +14,9 @@
 ##     `nim-flags` so every invocation gets the same isolation. `config.nims`
 ##     already supplies `--path:src --threads:on`; the recipes re-state
 ##     `--path:src` explicitly for the hermetic (`--skipParentCfg`) case.
+##     For the same reason every `nim` invocation names its own `--nimcache:`
+##     under `.nimcache/`, in the layout `config.nims` uses for everything
+##     else: `.nimcache/<module dir>/<module>_<d|r|check>`.
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
@@ -28,6 +31,11 @@ src-paths := "--path:src --path:tests"
 # `--threads:on` mirrors `config.nims` (the multi-thread producer test +
 # benchmarks spawn producer threads).
 nim-flags := "--skipParentCfg --skipUserCfg --threads:on --warning:BareExcept:off"
+
+# Per-checkout nimcache (see config.nims), relative to the recipe working
+# directory, which is this file's directory.  Nim's default,
+# `~/.cache/nim/<module>_<d|r>`, is shared by every checkout on the machine.
+nimcache := ".nimcache"
 
 # Layer-2 builds against the status-im nim-serialization + faststreams + stew
 # trees. In the workspace layout they are vendored under the sibling
@@ -48,10 +56,10 @@ srz-paths := ```
 # Build: compile (no run) both test files as a sanity check.
 build:
     @mkdir -p test-logs
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_ring_byte_blobs_r {{src-paths}} -d:release \
         -o:test-logs/test_ring_byte_blobs \
         tests/test_ring_byte_blobs.nim 2>&1 | tee test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} {{srz-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_typed_queue_nim_spectrum_r {{src-paths}} {{srz-paths}} -d:release \
         -o:test-logs/test_typed_queue_nim_spectrum \
         tests/test_typed_queue_nim_spectrum.nim 2>&1 | tee -a test-logs/build.log
 
@@ -61,22 +69,24 @@ test: test-unit test-integration
 # L1 (SHM-QUEUE-L1): byte-blob MPSC ring coordination corner cases.
 test-unit:
     @mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_ring_byte_blobs_d {{src-paths}} \
         tests/test_ring_byte_blobs.nim 2>&1 | tee test-logs/test-unit.log
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_nimcache_is_worktree_local_d {{src-paths}} \
+        tests/test_nimcache_is_worktree_local.nim 2>&1 | tee -a test-logs/test-unit.log
 
 # L2 (SHM-QUEUE-L2): typed `(T, Format)` spectrum + cross-process roundtrip.
 test-integration:
     @mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} {{srz-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_typed_queue_nim_spectrum_d {{src-paths}} {{srz-paths}} \
         tests/test_typed_queue_nim_spectrum.nim 2>&1 | tee test-logs/test-integration.log
 
 # Compile-check the benchmarks (no run) so they never bit-rot.
 bench-check:
     @mkdir -p test-logs
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/bench_ring_throughput_r {{src-paths}} -d:release \
         -o:test-logs/bench_ring_throughput \
         benchmarks/bench_ring_throughput.nim 2>&1 | tee test-logs/bench-check.log
-    nim c {{nim-flags}} {{src-paths}} {{srz-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/bench_typed_queue_r {{src-paths}} {{srz-paths}} -d:release \
         -o:test-logs/bench_typed_queue \
         benchmarks/bench_typed_queue.nim 2>&1 | tee -a test-logs/bench-check.log
 
@@ -99,10 +109,10 @@ lint-nim:
     mkdir -p test-logs
     # Umbrella `src/shm_queue.nim` transitively imports `faststreams`, so it
     # needs the same status-im src roots (`srz-paths`) the L2 checks thread.
-    nim check {{nim-flags}} {{src-paths}} {{srz-paths}} src/shm_queue.nim 2>&1 | tee test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} \
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/src/shm_queue_check {{src-paths}} {{srz-paths}} src/shm_queue.nim 2>&1 | tee test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_ring_byte_blobs_check {{src-paths}} \
         tests/test_ring_byte_blobs.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} {{srz-paths}} \
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_typed_queue_nim_spectrum_check {{src-paths}} {{srz-paths}} \
         tests/test_typed_queue_nim_spectrum.nim 2>&1 | tee -a test-logs/lint-nim.log
 
 # Format: nimpretty when available.
@@ -121,5 +131,5 @@ bump-version version:
 
 # Clean test-logs + built binaries.
 clean:
-    rm -rf test-logs
+    rm -rf test-logs .nimcache
     find tests benchmarks -maxdepth 1 -type f -executable -not -name "*.nim" -delete
