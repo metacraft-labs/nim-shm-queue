@@ -15,5 +15,6 @@ test-logs/
 tests/test_ring_byte_blobs
 tests/test_ring_block_producer
 tests/test_typed_queue_nim_spectrum
+tests/test_nimcache_is_worktree_local
 benchmarks/bench_ring_throughput
 benchmarks/bench_typed_queue
