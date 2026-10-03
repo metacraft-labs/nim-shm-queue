@@ -53,7 +53,7 @@ srz-paths := ```
 
 # --- Default targets (per Repo-Requirements.md) ---
 
-# Build: compile (no run) both test files as a sanity check.
+# Build: compile all four tracked test modules without executing them.
 build:
     @mkdir -p test-logs
     nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_ring_byte_blobs_r {{src-paths}} -d:release \
@@ -63,7 +63,14 @@ build:
         -o:test-logs/test_typed_queue_nim_spectrum \
         tests/test_typed_queue_nim_spectrum.nim 2>&1 | tee -a test-logs/build.log
 
-# Test: run the L1 + L2 suites (the same two files `nimble test` runs).
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_ring_block_producer_r {{src-paths}} -d:release \
+        -o:test-logs/test_ring_block_producer \
+        tests/test_ring_block_producer.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_nimcache_is_worktree_local_r {{src-paths}} -d:release \
+        -o:test-logs/test_nimcache_is_worktree_local \
+        tests/test_nimcache_is_worktree_local.nim 2>&1 | tee -a test-logs/build.log
+
+# Test: run the complete four-module corpus, matching nimble test.
 test: test-unit test-integration
 
 # L1 (SHM-QUEUE-L1): byte-blob MPSC ring coordination corner cases.
@@ -73,6 +80,9 @@ test-unit:
         tests/test_ring_byte_blobs.nim 2>&1 | tee test-logs/test-unit.log
     nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_nimcache_is_worktree_local_d {{src-paths}} \
         tests/test_nimcache_is_worktree_local.nim 2>&1 | tee -a test-logs/test-unit.log
+
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_ring_block_producer_d {{src-paths}} \
+        tests/test_ring_block_producer.nim 2>&1 | tee -a test-logs/test-unit.log
 
 # L2 (SHM-QUEUE-L2): typed `(T, Format)` spectrum + cross-process roundtrip.
 test-integration:
@@ -96,14 +106,14 @@ bench: bench-check
     ./test-logs/bench_ring_throughput
     ./test-logs/bench_typed_queue
 
-# Lint: nim check over the umbrella + submodules + both test files.
+# Lint: nim check over the umbrella and all four tracked test modules.
 lint: lint-nim
 
 lint-nim:
     #!/usr/bin/env bash
     # `pipefail` so a non-zero `nim check` exit propagates through the
     # `| tee` pipeline into `just lint`'s exit code (otherwise `tee`'s RC=0
-    # masks a failing check — a false green). `-e` so ANY of the three
+    # masks a failing check — a false green). `-e` so ANY of the owning
     # checks failing fails the whole recipe.
     set -euo pipefail
     mkdir -p test-logs
@@ -114,6 +124,11 @@ lint-nim:
         tests/test_ring_byte_blobs.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_typed_queue_nim_spectrum_check {{src-paths}} {{srz-paths}} \
         tests/test_typed_queue_nim_spectrum.nim 2>&1 | tee -a test-logs/lint-nim.log
+
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_ring_block_producer_check {{src-paths}} \
+        tests/test_ring_block_producer.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_nimcache_is_worktree_local_check {{src-paths}} \
+        tests/test_nimcache_is_worktree_local.nim 2>&1 | tee -a test-logs/lint-nim.log
 
 # Format: nimpretty when available.
 format: format-nim
