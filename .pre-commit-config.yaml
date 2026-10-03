@@ -1,0 +1,90 @@
+# THE MCL STANDARD HOOK SET (`mcl-standard-hooks`), portable committed form,
+# COMPLETE.
+#
+# Required by name in
+# metacraft-dev-guidelines/policies/repo-requirements.md §4: "a repo opts in by
+# naming the set, not by enumerating hooks". §4.1 gives two adoption forms and
+# says which one is ours: a repo that consumes the devops-modules flake imports
+# `nixos-modules.modules.flake.git-hooks`; anything else -- and every Windows
+# developer -- copies the block from devops-modules'
+# `git-hooks/mcl-standard-hooks.yaml` into a committed
+# `.pre-commit-config.yaml` and pins `rev:` to a devops-modules sha.
+#
+# THIS REPO HAS NO `flake.nix`, AND THAT IS NOT THE DEFECT. §4.1: "A repo that
+# is deliberately flake-free for Windows support is not defective; its fix is a
+# committed config, not a new flake." The defect was having no hooks at all -- a
+# `/nix/store` symlink produces nothing on Windows and nothing outside the
+# devShell, and this repo did not even have one of those.
+#
+# Install:  prek install --install-hooks     (or: pre-commit install)
+# Run:      prek run --all-files
+#
+# MEMBERSHIP MUST MATCH devops-modules' `git-hooks/mcl-standard-hooks.yaml` and
+# `git-hooks/standard-hooks.nix`. Two expressions of one list that disagree are
+# worse than one awkward list, because neither reader can tell which is the rule.
+#
+# BOTH COMMITTED-BINARY HOOKS ACT ON ADDED FILES ONLY
+# (`git diff --staged --diff-filter=A`), so adopting them does not retroactively
+# fail anything already tracked. Re-verified against the versions pinned below:
+# an added 2 MiB non-recording is refused; an added `*.ct` file and an added
+# member of a `*.ct/` directory are both refused; an added 1,000,000 B
+# non-recording is accepted; and MODIFYING an already-tracked `.ct` is accepted.
+# `--enforce-all` is deliberately not passed and must not be added to "tighten"
+# it.
+#
+# THE FORMATTING TIER'S FIRST-ADOPTION COST WAS MEASURED IN THIS REPO BEFORE IT
+# WAS ENABLED, and it is markdown-only or nil -- which is why this file carries
+# the complete set rather than the refusal pair some sibling repos got.
+
+minimum_pre_commit_version: "3.0.0"
+
+repos:
+  # --- The committed-binaries tier. Mandatory, strict by default. -----------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # 1024 KB passed explicitly because UPSTREAM'S DEFAULT IS 500 KB; dropping
+      # the argument silently halves the ceiling.
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: end-of-file-fixer
+
+  - repo: https://github.com/metacraft-labs/devops-modules
+    # Pinned to a sha, never to a branch: a hook set that changes under a repo
+    # without a commit in that repo is a hook set nobody can bisect.
+    rev: 6ba34072850f7348e1669a6daf8a0acb79669434
+    hooks:
+      - id: ban-added-ct-recordings
+
+  # --- Formatting and style. `language: system`, so the tool comes from the
+  # --- dev env (Nix devShell on Linux/macOS, winget/scoop/chocolatey on
+  # --- Windows) rather than from a hook environment this file would pin per OS.
+  # --- This is the agent-harbor pattern: the flake provides the TOOLS, the
+  # --- committed config provides the RULES.
+  - repo: local
+    hooks:
+      - id: editorconfig-checker
+        name: editorconfig-checker
+        entry: editorconfig-checker
+        language: system
+        types: [file]
+
+      - id: nixfmt
+        name: nixfmt
+        entry: nixfmt
+        language: system
+        files: \.nix$
+
+      - id: terraform-format
+        name: terraform-format
+        description: Format Terraform/OpenTofu HCL files
+        entry: tofu fmt
+        language: system
+        types: [file]
+        files: \.(tf|tftest\.hcl)$
+
+      - id: prettier
+        name: prettier
+        entry: prettier --check --list-different=false --log-level=warn --ignore-unknown --write
+        language: system
+        types: [text]
