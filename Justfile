@@ -44,8 +44,8 @@ nimcache := ".nimcache"
 srz-paths := ```
     p=""
     for d in ../reprobuild/libs/nim-serialization/src \
-             ../reprobuild/libs/nim-faststreams/src \
-             ../reprobuild/libs/nim-stew/src; do
+              ../reprobuild/libs/nim-faststreams/src \
+              ../reprobuild/libs/nim-stew/src; do
       [ -d "$d" ] && p="$p --path:$d"
     done
     echo "$p"
