@@ -3,15 +3,11 @@
 ## **Follow-up rollout (FUP-A): give the new library the same treatment as
 ## the other workspace repos.** This is a Nim leaf library — a layered
 ## shared-memory MPSC queue: a byte-blob ring (L1) + a typed ``(T, Format)``
-## queue (L2) over a compact binary flavor. It has NO in-scope sibling
-## build dependency of its own: every importable module lives under this
-## repo's ``src/`` tree. The L2 suite compiles against the status-im
-## ``serialization`` / ``faststreams`` / ``stew`` trees, but those are
-## THIRD-PARTY (rollout-excluded, no ``repro.nim`` / ``library`` producer),
-## so they are threaded via the L2 edge's ``paths:`` slot (resolved by
-## ``--path``, exactly as ``config.nims``'s ``srzPaths`` does) rather than a
-## ``uses: "<sibling>"`` edge. So the ``uses:`` block is just the toolchain
-## floor and there is no ``uses: "<sibling>"`` edge — the lock is self-only.
+## queue (L2) over a compact binary flavor. The L2 source obligation is
+## the adjacent immutable reprobuild checkout's vendored serialization,
+## faststreams and stew directories. They are source inputs and search
+## paths, not a DSL dependency on the Repro engine package. Workspace
+## reachability and the locked sibling checkout supply their source owner.
 ##
 ## A Mode 1 / Mode 3 hybrid (per
 ## ``reprobuild-specs/Three-Mode-Convention-System.md``) modelled on the
@@ -122,6 +118,10 @@ const shmQueueTestSpecs: seq[ShmQueueTestSpec] = @[
   # status-im serialization/faststreams/stew src roots via `paths:`.
   ShmQueueTestSpec(source: "tests/test_typed_queue_nim_spectrum.nim",
     binary: "build/test-bin/test_typed_queue_nim_spectrum", needsSrz: true),
+  ShmQueueTestSpec(source: "tests/test_ring_block_producer.nim",
+    binary: "build/test-bin/test_ring_block_producer", needsSrz: false),
+  ShmQueueTestSpec(source: "tests/test_nimcache_is_worktree_local.nim",
+    binary: "build/test-bin/test_nimcache_is_worktree_local", needsSrz: false),
 ]
 
 const shmQueueBenchSpecs: seq[ShmQueueTestSpec] = @[
@@ -144,7 +144,10 @@ package shm_queue:
     # ``gcc >=12`` matches the workspace toolchain floor. Sufficient for the
     # path-mode resolver under ``nix develop``.
     "nim >=2.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang >=14"
+    else:
+      "gcc >=12"
 
   # Library declaration — the ``src/`` tree ``config.nims`` puts on
   # ``--path`` (``switch("path", "src")``) is importable when this package
@@ -188,6 +191,17 @@ package shm_queue:
       if needsSrz:
         for p in srzPaths: result.add(p)
 
+    proc inputsFor(needsSrz: bool): seq[string] =
+      result = @["src", "tests", "config.nims", "shm_queue.nimble"]
+      if needsSrz:
+        for p in srzPaths: result.add(p)
+
+    proc bindBackend(actionId: string) =
+      when defined(macosx):
+        appendRegisteredActionToolIdentityRefs(actionId, @["clang"])
+      else:
+        appendRegisteredActionToolIdentityRefs(actionId, @["gcc"])
+
     proc emitTestPair(spec: ShmQueueTestSpec;
                       buildActions, executeActions: var seq[BuildActionDef]) =
       let stem = stemOf(spec.binary)
@@ -195,15 +209,22 @@ package shm_queue:
         source = spec.source,
         binary = spec.binary,
         paths = pathsFor(spec.needsSrz),
-        extraInputs = @["src"],
+        extraInputs = inputsFor(spec.needsSrz),
         actionId = "shm_queue.test_build." & stem)
+      bindBackend(edge.action.id)
       buildActions.add(edge.action)
       # ``registerImplicitName = false`` because the BUILD edge already owns
       # the binary basename as the implicit target name; the explicit
       # ``actionId`` is the execute edge's selector (two-edge shape).
+      let runtimeInputs = if spec.source == "tests/test_nimcache_is_worktree_local.nim":
+        @["src", "tests", "config.nims", "shm_queue.nimble"]
+      else: newSeq[string]()
       let executeEdge = edge.testBinary.run(
         actionId = "shm_queue.test_execute." & stem,
-        registerImplicitName = false)
+        registerImplicitName = false,
+        extraInputs = runtimeInputs)
+      if spec.source == "tests/test_nimcache_is_worktree_local.nim":
+        appendRegisteredActionToolIdentityRefs(executeEdge.id, @["nim"])
       executeActions.add(executeEdge)
 
     proc emitBenchBuild(spec: ShmQueueTestSpec;
@@ -216,8 +237,9 @@ package shm_queue:
         binary = spec.binary,
         defines = @["release"],
         paths = pathsFor(spec.needsSrz),
-        extraInputs = @["src"],
+        extraInputs = inputsFor(spec.needsSrz),
         actionId = "shm_queue.bench_build." & stem)
+      bindBackend(edge.action.id)
       buildActions.add(edge.action)
 
     for spec in shmQueueTestSpecs:
