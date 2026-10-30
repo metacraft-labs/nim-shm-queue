@@ -569,3 +569,39 @@ when shmSegmentSupported:
         check base[ringBase + ringSpan + i] == byte(0xB0 + (i and 0x0F))
 
       discard munmap(p, regionSize)
+
+suite "segment file backing":
+  test "a created ring's file is backed with storage, not left sparse":
+    # `createSegment` writes the ring header through a MAP_SHARED mapping of a
+    # file it has just sized. A length recorded by `ftruncate` alone leaves the
+    # region sparse, and when the filesystem is full the first store faults
+    # with SIGBUS instead of returning an error (measured on rpi2's tmpfs
+    # `/tmp`, 2026-10-30, in the sibling nim-shm-gset library). The segment is
+    # therefore preallocated, and this measures it: `st_blocks` covers the
+    # length. The sparse file is the negative control that shows the
+    # filesystem can tell the two apart; where it cannot, the case is skipped.
+    proc allocatedBytes(path: string): int64 =
+      var st: Stat
+      doAssert stat(path.cstring, st) == 0
+      int64(st.st_blocks) * 512
+    var dir = getTempDir()
+    when defined(linux):
+      if dirExists("/dev/shm"): dir = "/dev/shm"
+    inc tmpCounter
+    let base = dir / ("shmq-test-backed-" & $getpid() & "-" & $tmpCounter)
+    let sparse = base & ".sparse"
+    let fd = open(sparse.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
+    doAssert fd >= 0
+    let size = segRegionSize(64, 256)
+    doAssert ftruncate(fd, Off(size)) == 0
+    discard close(fd)
+    defer: cleanup(sparse)
+    if allocatedBytes(sparse) >= size:
+      skip()
+    else:
+      let path = base & ".seg"
+      defer: cleanup(path)
+      var r = createRing(path, 64, 256, bootId())
+      check r.seg.isValid
+      check allocatedBytes(path) >= size          # PRIMARY ASSERTION
+      r.seg.detach()

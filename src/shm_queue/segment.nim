@@ -309,7 +309,17 @@ when shmSegmentSupported:
     let tfd = open(tmp.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
     if tfd < 0:
       return
-    if ftruncate(tfd, Off(size)) != 0:
+    # Size the file AND back every byte with storage. `ftruncate` alone leaves
+    # the region sparse, and on a full filesystem (tmpfs in particular) the
+    # first write through the MAP_SHARED mapping is then delivered as SIGBUS
+    # rather than as an error; `posix_fallocate` reports ENOSPC here instead,
+    # where it is still a clean "segment unavailable". Same fix and measurement
+    # as nim-shm-gset's `setFileSize` (rpi2, 2026-10-30). A filesystem that
+    # cannot preallocate (EOPNOTSUPP/EINVAL) keeps the previous ftruncate path.
+    let allocRc = posix_fallocate(tfd, Off(0), Off(size))
+    if allocRc != 0 and
+        not ((allocRc == EOPNOTSUPP or allocRc == EINVAL) and
+             ftruncate(tfd, Off(size)) == 0):
       discard close(tfd); removeFile(tmp); return
     discard close(tfd)
     try:
