@@ -56,17 +56,18 @@
 ##     mode); the test edges use the default (debug) build, matching a bare
 ##     ``nim c -r`` on the file / ``nimble test``.
 ##
-## **Per-test platform gating.** Both test files compile + run to exit 0 on
-## this Linux host. The fork-based multi-PROCESS suites and the
-## ``EmbeddedRing`` suite self-gate at runtime via ``shmSegmentSupported`` /
-## ``when not shmSegmentSupported: skip()`` inside the file — a POSITIVE
-## capability arm, not a compile gate — so the whole corpus is portable and
-## every edge is unconditionally in the graph (no ``when defined(...)``
-## extraction gate is needed).
+## **Per-test platform gating.** Every test and benchmark file compiles and
+## runs on every platform, so every edge is unconditionally in the graph (no
+## ``when defined(...)`` extraction gate). Inside the files, the cases that
+## need the cross-process mmap segment (boot guard, on-disk header checks,
+## re-attach, fork producers, file preallocation) are compiled only where
+## ``shmSegmentSupported`` (Linux, macOS) and elsewhere print their reason and
+## report SKIPPED; every other case runs, over a process-local segment where
+## the cross-process one does not exist.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical leaf recipes: the nix dev shell puts ``nim`` + ``gcc`` on
-## ``PATH``, so the weak-local PATH resolver is the right default. Without
+## canonical leaf recipes: this repo's nix dev shell (``flake.nix``) puts
+## ``nim`` + ``gcc`` (``clang`` on macOS) on ``PATH``, so the weak-local PATH resolver is the right default. Without
 ## it ``repro build`` refuses to run with "typed tool provisioning is
 ## required for uses declarations".
 
@@ -157,9 +158,11 @@ package shm_queue:
   library shm_queue
 
   devEnv:
-    # Reuse the workspace toolchain until native provisioning replaces the flake.
+    # This repository's own flake dev shell (nim, the C back-end, just), so the
+    # env activates from a standalone checkout, as CI makes one. Windows has no
+    # Nix; its toolchain comes from the `uses:` floor above.
     when not defined(windows):
-      useFlakeDevShell("..")
+      useFlakeDevShell()
     task "bump-version", command = "just bump-version", description = "Bump version number (version.txt)"
 
   build:

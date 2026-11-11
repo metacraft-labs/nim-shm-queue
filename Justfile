@@ -7,8 +7,9 @@
 ##     with the sibling `serialization`/`faststreams`/`stew` src paths L2
 ##     needs. `test-unit` is the L1 corner-case suite; `test-integration`
 ##     the L2 cross-process typed-roundtrip suite.
-##   * `lint` is `nim check` over the umbrella + submodules + both test
-##     files (no `flake.nix` in this repo → no `nixfmt` cross-check).
+##   * `lint` is `nim check` over the umbrella + submodules + the test
+##     files. `flake.nix` formatting is checked by the committed pre-commit
+##     config's `nixfmt` hook.
 ##   * `format` runs `nimpretty` when available.
 ##   * Hermetic flags (`--skipParentCfg --skipUserCfg`) are baked into
 ##     `nim-flags` so every invocation gets the same isolation. `config.nims`
