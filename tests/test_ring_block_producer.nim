@@ -72,6 +72,25 @@ suite "opBlockProducer: uncontended parity with the drop ring":
     check r.droppedCount() == 0
     r.detach()
 
+  test "a registered consumer is still alive seconds later":
+    # `registerConsumer` stamps `bootId()` and `consumerAlive` compares the
+    # stamp with a later call. When `bootId()` was the wall-clock second (on
+    # macOS), a live consumer read as gone once a second boundary passed, and
+    # a waiting producer returned `prConsumerGone`. Two seconds of real time
+    # crosses at least one boundary.
+    let path = freshPath("alive-later")
+    defer: cleanup(path)
+    when shmSegmentSupported:
+      var r = createBlockingRing(path, 8, 32, TestBoot)
+    else:
+      var r = createLocalBlockingRing(8, 32, TestBoot)
+    check r.isValid
+    r.registerConsumer()
+    check consumerAlive(r.seg.base)
+    sleep(2_100)
+    check consumerAlive(r.seg.base)
+    r.detach()
+
 # --- LF-4: dead consumer -> prConsumerGone, never a hang -------------------
 
 suite "opBlockProducer: dead consumer fails fast (LF-4)":

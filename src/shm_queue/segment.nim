@@ -148,6 +148,12 @@ type
       ## True when `base` is an in-process allocation from
       ## `createProcessLocalSegment` (freed by `detach`), not a file mapping.
 
+when defined(macosx):
+  proc sysctlbyname(name: cstring; oldp: pointer; oldlenp: ptr csize_t;
+      newp: pointer; newlen: csize_t): cint
+    {.importc, header: "<sys/sysctl.h>".}
+    ## Darwin `sysctlbyname(3)`; read here for `kern.boottime`.
+
 when not shmSegmentSupported:
   # Without cross-process segments a segment never outlives the process that
   # created it, so an identity fixed for the process lifetime is a valid boot
@@ -160,6 +166,19 @@ when not shmSegmentSupported:
 proc bootId*(): uint64 =
   ## Per-boot identity used to invalidate a stale post-reboot segment. Same
   ## shape as `repro_shm_index.bootId` / io-mon's `bootId`. Never returns zero.
+  ##
+  ## It must be constant for the whole boot. `attachSegment` compares the
+  ## creator's stamp with the attacher's `bootId()`, and `consumerAlive`
+  ## compares the consumer's registration stamp with a later call, so a value
+  ## that drifts within one boot makes a later attach reject a live segment
+  ## and a producer report a live consumer gone.
+  ##
+  ## Linux reads `/proc/sys/kernel/random/boot_id`. macOS reads
+  ## `kern.boottime` (`sysctl(3)`): a `struct timeval` fixed at boot, to
+  ## microsecond resolution, the source nim-shm-gset's `platformBootId` uses
+  ## for the same guard. The wall-clock fallback is reached only when neither
+  ## source can be read; it changes every second, so there a segment outlives
+  ## at most the second it was created in.
   when not shmSegmentSupported:
     processBootId
   else:
@@ -173,6 +192,15 @@ proc bootId*(): uint64 =
         return (h or 1'u64)
       except CatchableError:
         discard
+    elif defined(macosx):
+      var tv: Timeval
+      var size = csize_t(sizeof(tv))
+      if sysctlbyname("kern.boottime", addr tv, addr size, nil, 0) == 0 and
+          size == csize_t(sizeof(tv)):
+        let secs = uint64(tv.tv_sec)
+        let usecs = uint64(tv.tv_usec)
+        if secs != 0'u64:
+          return ((secs * 1_000_000'u64 + usecs) or 1'u64)
     let secs = uint64(epochTime().int64)
     (secs or 1'u64)
 

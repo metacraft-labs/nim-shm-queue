@@ -266,6 +266,42 @@ suite "boot-guard":
       check outBuf[0] == 9
       att2.detach()
 
+  test "the boot identity is stable across a real elapsed second":
+    # The boot guard and consumer liveness both compare a stored `bootId()`
+    # with a later call, so the identity must not change within one boot.
+    # On macOS it was the wall-clock second, recomputed per call: an attach
+    # or a liveness check made after a second boundary disagreed with the
+    # stamp. Two seconds of real time is the whole test, because the defect
+    # had one-second granularity and no shorter wait distinguishes "constant"
+    # from "constant for under a second". Runs on every platform: where there
+    # is no cross-process segment the identity is process-lifetime and must
+    # be stable too.
+    let first = bootId()
+    check first != 0'u64
+    sleep(2_100)
+    check bootId() == first
+
+  test "a segment created with bootId() still attaches seconds later":
+    crossProcessSegmentOnly("attach validates the creator boot id"):
+      # The consequence of the identity above at the level a consumer sees:
+      # a FRESH attach re-derives the boot id rather than inheriting the
+      # creator's, so it must accept a live segment after the clock moved.
+      let path = freshPath("bootguard-later")
+      defer: cleanup(path)
+      var creator = createRing(path, 8, 16, bootId())
+      check creator.isValid
+      check creator.tryPush(@[byte 7]) == prPushed
+      creator.detach()
+      sleep(2_100)
+      var att = attachRing(path)
+      check att.isValid
+      var outBuf = newSeq[byte](16)
+      let (dr, ol) = drainInto(att, outBuf)
+      check dr == drGot
+      check ol == 1
+      check outBuf[0] == 7
+      att.detach()
+
 # --- version-mismatch attach fails loudly ----------------------------------
 
 suite "version mismatch":
