@@ -22,7 +22,7 @@ on:
 
 jobs:
   reprobuild:
-    name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test
+    name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && '(x64 emulation)' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +43,14 @@ jobs:
             arch: arm64
             runner: [self-hosted, windows, arm64]
     runs-on: ${{ matrix.runner }}
+    env:
+      # Reprobuild and its monitor currently target x64 on Windows, so the
+      # ARM64 host runs this leg as x64 under emulation. The reprobuild DIY
+      # bootstrap (windows/toolchain-utils.ps1 Get-WindowsArch) honours this
+      # override; without it, it resolves 'arm64' and refuses to provision
+      # Nim (prebuilt mode is x64-only) and gcc (WinLibs ships no ARM64
+      # build). Empty on every other leg, which leaves detection alone.
+      WINDOWS_DIY_ARCH_OVERRIDE: ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && 'x64' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,9 +73,9 @@ jobs:
 
       - name: Setup dev env (reprobuild flavor)
         # setup-dev-env clones the siblings listed in .github/sibling-repos
-        # (self-only — nim-shm-queue is a leaf library with no `uses:`
-        # sibling edges) at the workspace-lock-pinned revisions before
-        # materialising the env.
+        # (reprobuild, whose vendored nim-serialization/faststreams/stew
+        # sources the L2 suite compiles against) at the workspace-lock-pinned
+        # revisions, then materialises the env from this repo's own flake.
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
