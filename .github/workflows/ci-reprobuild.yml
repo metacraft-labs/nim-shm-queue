@@ -86,19 +86,34 @@ jobs:
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
+        #
+        # Every repro and just step names its provisioning mode. The recipe's
+        # `path` default resolves whatever the runner's PATH carries, and on
+        # win-ci-bare-001 that is Free Pascal's gcc 2.95 (`nimbase.h: Invalid
+        # argument`). Windows provisions the declared `uses:` floor from
+        # archives, as the TermAssertClient and nim-stackable-hooks workflows
+        # do; the other hosts use Nix, as TermAssertClient's cross-checks do.
+        env:
+          REPRO_TOOL_PROVISIONING: ${{ runner.os == 'Windows' && 'tarball' || 'nix' }}
         run: dev-exec repro build
 
       - name: repro test
         # Materialises the `test` collection.
+        env:
+          REPRO_TOOL_PROVISIONING: ${{ runner.os == 'Windows' && 'tarball' || 'nix' }}
         run: dev-exec repro test
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so
         # we catch silent divergences between `repro build` outputs
         # and what the dev shell + Justfile produce today.
+        env:
+          REPRO_TOOL_PROVISIONING: ${{ runner.os == 'Windows' && 'tarball' || 'nix' }}
         run: dev-exec just build
 
       - name: just test (cross-check)
+        env:
+          REPRO_TOOL_PROVISIONING: ${{ runner.os == 'Windows' && 'tarball' || 'nix' }}
         run: dev-exec just test
 
       # Diagnostics on failure. Three things below are load-bearing:
