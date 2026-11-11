@@ -9,17 +9,27 @@
 ##
 ## The default `ShmRing` (bare, no policy) stays `opDropSignalled`; that is
 ## covered by `test_ring_byte_blobs`. Here we prove the new policy.
+##
+## Platform scope. The uncontended parity case is platform-neutral and runs
+## everywhere (over a process-local segment where the cross-process one does
+## not exist). The dead-consumer and backpressure cases fork producer processes
+## and probe a forged consumer pid, so they need the cross-process segment and
+## are compiled only where it exists; elsewhere they print why and report
+## SKIPPED.
 
-import std/[os, posix, sets, times, unittest]
+import std/[os, unittest]
 import shm_queue/[ring, segment]
+when shmSegmentSupported:
+  import std/[posix, sets, times]
 
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
+  proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+  proc quitChild(code: cint) {.noreturn.} = cExit(code)
 
 var tmpCounter = 0
 proc freshPath(tag: string): string =
   inc tmpCounter
-  getTempDir() / ("shmq-block-" & tag & "-" & $getpid() & "-" & $tmpCounter & ".seg")
+  getTempDir() / ("shmq-block-" & tag & "-" & $getCurrentProcessId() & "-" &
+    $tmpCounter & ".seg")
 
 proc cleanup(path: string) =
   try: removeFile(path)
@@ -27,13 +37,27 @@ proc cleanup(path: string) =
 
 const TestBoot = 0xABCDEF01'u64
 
+template crossProcessSegmentOnly(reason: string; body: untyped) =
+  ## Compile `body` only where the cross-process segment exists; elsewhere say
+  ## why and mark the test SKIPPED (never a silent pass).
+  when shmSegmentSupported:
+    body
+  else:
+    echo "    SKIPPED: needs the cross-process shared-memory segment (" &
+      reason & "), which this platform does not implement"
+    skip()
+
 # --- uncontended parity ----------------------------------------------------
 
 suite "opBlockProducer: uncontended parity with the drop ring":
   test "push/drain roundtrip + FIFO, never drops on a non-full ring":
     let path = freshPath("parity")
     defer: cleanup(path)
-    var r = createBlockingRing(path, 8, 32, TestBoot)
+    # The cross-process segment where it exists, a process-local one elsewhere.
+    when shmSegmentSupported:
+      var r = createBlockingRing(path, 8, 32, TestBoot)
+    else:
+      var r = createLocalBlockingRing(8, 32, TestBoot)
     check r.isValid
     r.registerConsumer()
     var outBuf = newSeq[byte](32)
@@ -52,95 +76,97 @@ suite "opBlockProducer: uncontended parity with the drop ring":
 
 suite "opBlockProducer: dead consumer fails fast (LF-4)":
   test "a full ring with a dead consumer returns prConsumerGone":
-    let path = freshPath("gone")
-    defer: cleanup(path)
-    const cap = 2
-    var r = createBlockingRing(path, cap, 16, TestBoot)
-    check r.isValid
+    crossProcessSegmentOnly("a forked, reaped child stands in for the dead consumer"):
+      let path = freshPath("gone")
+      defer: cleanup(path)
+      const cap = 2
+      var r = createBlockingRing(path, cap, 16, TestBoot)
+      check r.isValid
 
-    # Forge a consumer-liveness token that points at a definitely-dead pid on
-    # the current boot: fork a child, reap it, then claim its pid as consumer.
-    let child = fork()
-    if child == 0:
-      quitChild(0)
-    var status: cint
-    discard waitpid(child, status, 0)
-    let base = r.seg.base
-    storeU64Relaxed(base, HdrOffConsumerBoot, bootId())
-    storeU64Relaxed(base, HdrOffConsumerPid, uint64(child))
-    storeU64Release(base, HdrOffConsumerAlive, 1)
+      # Forge a consumer-liveness token that points at a definitely-dead pid on
+      # the current boot: fork a child, reap it, then claim its pid as consumer.
+      let child = fork()
+      if child == 0:
+        quitChild(0)
+      var status: cint
+      discard waitpid(child, status, 0)
+      let base = r.seg.base
+      storeU64Relaxed(base, HdrOffConsumerBoot, bootId())
+      storeU64Relaxed(base, HdrOffConsumerPid, uint64(child))
+      storeU64Release(base, HdrOffConsumerAlive, 1)
 
-    # Fill the ring, then the overflowing push must NOT hang — it detects the
-    # dead consumer and returns prConsumerGone within a bounded time.
-    for i in 0 ..< cap:
-      check r.tryPush(@[byte(i)]) == prPushed
-    let t0 = epochTime()
-    check r.tryPush(@[byte 99]) == prConsumerGone
-    check (epochTime() - t0) < 5.0 # bounded: no unbounded hang
-    check r.droppedCount() == 0    # never a drop
-    r.detach()
+      # Fill the ring, then the overflowing push must NOT hang — it detects the
+      # dead consumer and returns prConsumerGone within a bounded time.
+      for i in 0 ..< cap:
+        check r.tryPush(@[byte(i)]) == prPushed
+      let t0 = epochTime()
+      check r.tryPush(@[byte 99]) == prConsumerGone
+      check (epochTime() - t0) < 5.0 # bounded: no unbounded hang
+      check r.droppedCount() == 0    # never a drop
+      r.detach()
 
 # --- LF-1: zero loss under backpressure, many processes, tiny ring ---------
 
 suite "opBlockProducer: zero loss under backpressure (LF-1)":
   test "N fork children each push M distinct blobs into a TINY ring; all arrive":
-    let path = freshPath("noloss")
-    defer: cleanup(path)
-    const
-      nProc = 4
-      perProc = 4000
-      cap = 8 # deliberately tiny: producers WILL block and wait for the drain
-    var r = createBlockingRing(path, cap, 16, bootId())
-    check r.isValid
-    r.registerConsumer() # publish liveness so children never see prConsumerGone
+    crossProcessSegmentOnly("fork producers attach by path"):
+      let path = freshPath("noloss")
+      defer: cleanup(path)
+      const
+        nProc = 4
+        perProc = 4000
+        cap = 8 # deliberately tiny: producers WILL block and wait for the drain
+      var r = createBlockingRing(path, cap, 16, bootId())
+      check r.isValid
+      r.registerConsumer() # publish liveness so children never see prConsumerGone
 
-    var pids: seq[Pid]
-    for c in 0 ..< nProc:
-      let pid = fork()
-      if pid == 0:
-        # CHILD producer: NO retry loop — the block policy itself guarantees the
-        # push lands (or the consumer is gone, which is a hard error here).
-        var cr = attachBlockingRing(path)
-        if not cr.isValid:
-          quitChild(2)
-        for i in 0 ..< perProc:
-          var blob = newSeq[byte](8)
-          blob[0] = byte(c)
-          blob[1] = byte(i and 0xFF)
-          blob[2] = byte((i shr 8) and 0xFF)
-          blob[3] = byte((i shr 16) and 0xFF)
-          if cr.tryPush(blob) != prPushed:
-            cr.detach(); quitChild(3) # any drop / consumerGone is a failure
-        cr.detach()
-        quitChild(0)
-      else:
-        check pid > 0
-        pids.add(pid)
+      var pids: seq[Pid]
+      for c in 0 ..< nProc:
+        let pid = fork()
+        if pid == 0:
+          # CHILD producer: NO retry loop — the block policy itself guarantees the
+          # push lands (or the consumer is gone, which is a hard error here).
+          var cr = attachBlockingRing(path)
+          if not cr.isValid:
+            quitChild(2)
+          for i in 0 ..< perProc:
+            var blob = newSeq[byte](8)
+            blob[0] = byte(c)
+            blob[1] = byte(i and 0xFF)
+            blob[2] = byte((i shr 8) and 0xFF)
+            blob[3] = byte((i shr 16) and 0xFF)
+            if cr.tryPush(blob) != prPushed:
+              cr.detach(); quitChild(3) # any drop / consumerGone is a failure
+          cr.detach()
+          quitChild(0)
+        else:
+          check pid > 0
+          pids.add(pid)
 
-    # PARENT consumer: drain exactly nProc*perProc distinct records. Its draining
-    # is what frees slots and wakes the blocked producers.
-    var seen = initHashSet[(int, int)]()
-    var outBuf = newSeq[byte](16)
-    let target = nProc * perProc
-    while seen.len < target:
-      var outLen = 0
-      if r.tryDrainOne(outBuf, outLen) == drGot:
-        check outLen == 8
-        let c = int(outBuf[0])
-        let idx = int(outBuf[1]) or (int(outBuf[2]) shl 8) or (int(outBuf[3]) shl 16)
-        check (not seen.contains((c, idx))) # no duplicates / no phantoms
-        seen.incl((c, idx))
+      # PARENT consumer: drain exactly nProc*perProc distinct records. Its draining
+      # is what frees slots and wakes the blocked producers.
+      var seen = initHashSet[(int, int)]()
+      var outBuf = newSeq[byte](16)
+      let target = nProc * perProc
+      while seen.len < target:
+        var outLen = 0
+        if r.tryDrainOne(outBuf, outLen) == drGot:
+          check outLen == 8
+          let c = int(outBuf[0])
+          let idx = int(outBuf[1]) or (int(outBuf[2]) shl 8) or (int(outBuf[3]) shl 16)
+          check (not seen.contains((c, idx))) # no duplicates / no phantoms
+          seen.incl((c, idx))
 
-    for pid in pids:
-      var st: cint
-      let w = waitpid(pid, st, 0)
-      check w == pid
-      check WIFEXITED(st)
-      check WEXITSTATUS(st) == 0 # every child pushed all records with no drop
+      for pid in pids:
+        var st: cint
+        let w = waitpid(pid, st, 0)
+        check w == pid
+        check WIFEXITED(st)
+        check WEXITSTATUS(st) == 0 # every child pushed all records with no drop
 
-    # LF-1: exactly target distinct records crossed the tiny ring, none lost,
-    # none phantom, and the SIGNALLED drop counter is zero (nothing was dropped).
-    check seen.len == target
-    check r.droppedCount() == 0
-    r.markConsumerGone()
-    r.detach()
+      # LF-1: exactly target distinct records crossed the tiny ring, none lost,
+      # none phantom, and the SIGNALLED drop counter is zero (nothing was dropped).
+      check seen.len == target
+      check r.droppedCount() == 0
+      r.markConsumerGone()
+      r.detach()
