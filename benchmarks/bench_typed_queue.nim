@@ -45,12 +45,27 @@ proc sampleEvent(i: int): DepEvent =
 
 # --- Layer-2: encode+push+drain+decode, interleaved single thread -----------
 
+proc benchQueue(path: string): TypedShmQueue[DepEvent, ShmBinary] =
+  ## The cross-process file-backed segment where it exists; a process-local
+  ## one elsewhere, so the encode/push/drain/decode path is still measured.
+  when shmSegmentSupported:
+    createTypedQueue[DepEvent, ShmBinary](path, Cap, Slot, bootId())
+  else:
+    createLocalTypedQueue[DepEvent, ShmBinary](Cap, Slot, bootId())
+
+proc benchRing(path: string): ShmRing[opDropSignalled] =
+  ## Layer-1 counterpart of `benchQueue`.
+  when shmSegmentSupported:
+    createRing(path, Cap, Slot, bootId())
+  else:
+    createLocalRing(Cap, Slot, bootId())
+
 proc benchTyped(nOps: int): float =
   let path = getTempDir() / ("shmq-tqbench-" & $getCurrentProcessId() & ".seg")
   defer:
     try: removeFile(path)
     except CatchableError: discard
-  var q = createTypedQueue[DepEvent, ShmBinary](path, Cap, Slot, bootId())
+  var q = benchQueue(path)
   doAssert q.isValid
   var got: DepEvent
 
@@ -84,7 +99,7 @@ proc benchRawL1(nOps: int; blobLen: int): float =
   defer:
     try: removeFile(path)
     except CatchableError: discard
-  var r = createRing(path, Cap, Slot, bootId())
+  var r = benchRing(path)
   doAssert r.isValid
   var blob = newSeq[byte](blobLen)
   for i in 0 ..< blobLen: blob[i] = byte(i)

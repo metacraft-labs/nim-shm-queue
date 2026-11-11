@@ -25,25 +25,44 @@
 ## Plus a small multi-PROCESS roundtrip (fork a producer that pushes typed items;
 ## parent drains + decodes) to prove the typed layer works across the shm
 ## boundary.
+##
+## Platform scope. The type-spectrum and exact-fill suites are platform-neutral
+## and run everywhere: over the cross-process file-backed segment where
+## `shmSegmentSupported` (Linux, macOS), over a process-local segment elsewhere
+## (Windows). The multi-process roundtrip forks and needs the cross-process
+## segment; elsewhere it prints why and reports SKIPPED.
 
-import std/[os, posix, options, unittest]
+import std/[os, options, unittest]
 import serialization
 import faststreams/[inputs, outputs]
 import shm_queue/[typed_queue, binary_flavor]
+when shmSegmentSupported:
+  import std/posix
 
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
+  proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+  proc quitChild(code: cint) {.noreturn.} = cExit(code)
 
 var tmpCounter = 0
 proc freshPath(tag: string): string =
   inc tmpCounter
-  getTempDir() / ("shmq-tq-" & tag & "-" & $getpid() & "-" & $tmpCounter & ".seg")
+  getTempDir() / ("shmq-tq-" & tag & "-" & $getCurrentProcessId() & "-" &
+    $tmpCounter & ".seg")
 
 proc cleanup(path: string) =
   try: removeFile(path)
   except CatchableError: discard
 
 const TestBoot = 0x7A11EDBEEF01'u64
+
+proc makeTypedQueue[T, Format](path: string; cap, maxBlobLen: int;
+    boot: uint64): TypedShmQueue[T, Format] =
+  ## The queue the platform-neutral suites run on: the cross-process
+  ## file-backed segment at `path` where it exists, a process-local one
+  ## elsewhere.
+  when shmSegmentSupported:
+    createTypedQueue[T, Format](path, cap, maxBlobLen, boot)
+  else:
+    createLocalTypedQueue[T, Format](cap, maxBlobLen, boot)
 
 # ---------------------------------------------------------------------------
 # A SECOND, genuinely-distinct Format `ShmBinaryRev`. It reuses the library's
@@ -187,7 +206,7 @@ func `==`(a, b: Variant): bool =
 proc roundtrip[T, Format](value: T; slot = 4096): T =
   let path = freshPath("rt")
   defer: cleanup(path)
-  var q = createTypedQueue[T, Format](path, 8, slot, TestBoot)
+  var q = makeTypedQueue[T, Format](path, 8, slot, TestBoot)
   check q.isValid
   check q.push(value) == prPushed
   var got: T
@@ -343,7 +362,7 @@ suite "exact-fill + overflow (oversize signalled, queue unchanged)":
     const slot = 4 + payloadLen           # u32 length prefix + bytes
     let path = freshPath("fill")
     defer: cleanup(path)
-    var q = createTypedQueue[seq[byte], ShmBinary](path, 8, slot, TestBoot)
+    var q = makeTypedQueue[seq[byte], ShmBinary](path, 8, slot, TestBoot)
     check q.isValid
 
     var exact = newSeq[byte](payloadLen)
@@ -374,6 +393,8 @@ suite "exact-fill + overflow (oversize signalled, queue unchanged)":
 suite "multi-process typed roundtrip":
   test "forked producer pushes typed items; parent drains + decodes":
     when not shmSegmentSupported:
+      echo "    SKIPPED: needs the cross-process shared-memory segment (a " &
+        "forked producer attaches by path), which this platform does not implement"
       skip()
     else:
       const N = 200

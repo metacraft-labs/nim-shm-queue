@@ -56,19 +56,31 @@
 ##     mode); the test edges use the default (debug) build, matching a bare
 ##     ``nim c -r`` on the file / ``nimble test``.
 ##
-## **Per-test platform gating.** Both test files compile + run to exit 0 on
-## this Linux host. The fork-based multi-PROCESS suites and the
-## ``EmbeddedRing`` suite self-gate at runtime via ``shmSegmentSupported`` /
-## ``when not shmSegmentSupported: skip()`` inside the file — a POSITIVE
-## capability arm, not a compile gate — so the whole corpus is portable and
-## every edge is unconditionally in the graph (no ``when defined(...)``
-## extraction gate is needed).
+## **Per-test platform gating.** Every test and benchmark file compiles and
+## runs on every platform, so every edge is unconditionally in the graph (no
+## ``when defined(...)`` extraction gate). Inside the files, the cases that
+## need the cross-process mmap segment (boot guard, on-disk header checks,
+## re-attach, fork producers, file preallocation) are compiled only where
+## ``shmSegmentSupported`` (Linux, macOS) and elsewhere print their reason and
+## report SKIPPED; every other case runs, over a process-local segment where
+## the cross-process one does not exist.
 ##
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical leaf recipes: the nix dev shell puts ``nim`` + ``gcc`` on
-## ``PATH``, so the weak-local PATH resolver is the right default. Without
-## it ``repro build`` refuses to run with "typed tool provisioning is
-## required for uses declarations".
+## canonical leaf recipes for local work: this repo's nix dev shell
+## (``flake.nix``) puts ``nim``, ``gcc`` (``clang`` on macOS), ``just``,
+## ``bash`` and coreutils on ``PATH``, so the weak-local PATH resolver is the
+## right default there. Without a mode ``repro build`` refuses to run with
+## "typed tool provisioning is required for uses declarations".
+##
+## CI does not rely on the PATH default. ``ci-reprobuild.yml`` sets
+## ``REPRO_TOOL_PROVISIONING`` to ``tarball`` on Windows and ``nix``
+## elsewhere for every ``repro`` and ``just`` step (the Windows half matches
+## the TermAssertClient and nim-stackable-hooks workflows). A Windows runner's ``PATH`` can
+## carry unrelated toolchains (win-ci-bare-001 has Free Pascal's gcc 2.95),
+## and the Windows env has no Nix shell to supply ``just``/``bash``/coreutils,
+## so the ``uses:`` floor below names the Justfile's command closure too:
+## ``dev-exec just build`` / ``just test`` run inside the env ``repro exec``
+## activates from these declarations.
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
@@ -148,6 +160,14 @@ package shm_queue:
       "clang >=14"
     else:
       "gcc >=12"
+    # The Justfile's command closure, for the ``just build`` / ``just test``
+    # / ``just lint`` cross-checks CI runs through ``dev-exec``: ``just``
+    # itself, the ``bash`` its ``set shell`` and shebang recipe name, and the
+    # coreutils those recipes invoke (``mkdir -p test-logs``, ``| tee``).
+    "just >=1"
+    "bash >=4"
+    "mkdir"
+    "tee"
 
   # Library declaration — the ``src/`` tree ``config.nims`` puts on
   # ``--path`` (``switch("path", "src")``) is importable when this package
@@ -157,9 +177,11 @@ package shm_queue:
   library shm_queue
 
   devEnv:
-    # Reuse the workspace toolchain until native provisioning replaces the flake.
+    # This repository's own flake dev shell (nim, the C back-end, just), so the
+    # env activates from a standalone checkout, as CI makes one. Windows has no
+    # Nix; its toolchain comes from the `uses:` floor above.
     when not defined(windows):
-      useFlakeDevShell("..")
+      useFlakeDevShell()
     task "bump-version", command = "just bump-version", description = "Bump version number (version.txt)"
 
   build:

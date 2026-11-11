@@ -14,6 +14,15 @@ const
   BlobLen = 48 ## representative RMDF-record-ish blob size
   Cap = 1024
 
+proc benchRing(path: string; cap, blobLen: int): ShmRing[opDropSignalled] =
+  ## The cross-process file-backed segment where it exists (what the consumers
+  ## run on); a process-local segment elsewhere, so the ring coordination is
+  ## still measured there.
+  when shmSegmentSupported:
+    createRing(path, cap, blobLen, bootId())
+  else:
+    createLocalRing(cap, blobLen, bootId())
+
 proc nowNs(): int64 = getMonoTime().ticks
 
 proc pctl(sorted: seq[int64]; p: float): int64 =
@@ -37,7 +46,7 @@ proc benchSingle(nOps: int): float =
   defer:
     try: removeFile(path)
     except CatchableError: discard
-  var r = createRing(path, Cap, BlobLen, bootId())
+  var r = benchRing(path, Cap, BlobLen)
   doAssert r.isValid
   var blob = newSeq[byte](BlobLen)
   for i in 0 ..< BlobLen: blob[i] = byte(i)
@@ -71,11 +80,17 @@ proc benchSingle(nOps: int): float =
 
 type ProdArg = object
   path: string
+  ring: ptr ShmRing[opDropSignalled] ## the consumer's ring (process-local)
   tid: int
   perThread: int
 
 proc producerThread(arg: ProdArg) {.thread.} =
-  var pr = attachRing(arg.path)
+  # Its own attach where the cross-process segment exists; the consumer's
+  # process-local ring, shared by address, elsewhere.
+  when shmSegmentSupported:
+    var pr = attachRing(arg.path)
+  else:
+    template pr: untyped = arg.ring[]
   doAssert pr.isValid
   var blob = newSeq[byte](BlobLen)
   blob[0] = byte(arg.tid)
@@ -86,14 +101,15 @@ proc producerThread(arg: ProdArg) {.thread.} =
     blob[3] = byte((i shr 16) and 0xFF)
     if pr.tryPush(blob) == prPushed:
       inc i
-  pr.detach()
+  when shmSegmentSupported:
+    pr.detach()
 
 proc benchNProducers(nThreads, perThread: int): float =
   let path = getTempDir() / ("shmq-bench-multi-" & $getCurrentProcessId() & ".seg")
   defer:
     try: removeFile(path)
     except CatchableError: discard
-  var r = createRing(path, Cap, BlobLen, bootId())
+  var r = benchRing(path, Cap, BlobLen)
   doAssert r.isValid
   let total = nThreads * perThread
 
@@ -103,7 +119,7 @@ proc benchNProducers(nThreads, perThread: int): float =
   let t0 = nowNs()
   for t in 0 ..< nThreads:
     createThread(threads[t], producerThread,
-      ProdArg(path: path, tid: t, perThread: perThread))
+      ProdArg(path: path, ring: addr r, tid: t, perThread: perThread))
 
   var drained = 0
   var outLen = 0

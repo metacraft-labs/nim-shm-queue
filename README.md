@@ -12,5 +12,15 @@ A layered shared-memory **multi-producer / single-consumer** queue for Nim.
 - **Layer 3 — consumers:** e.g. io-mon's discovered-dependency queue and
   reprobuild's action-cache submission ring, each on Layer 2.
 
+## Platforms
+
+The cross-process segment (`createSegment` / `attachSegment`, an mmap'd file
+shared between processes) is available on Linux and macOS
+(`shmSegmentSupported`). Everything else — the ring coordination, both
+overflow policies, `EmbeddedRing`, Layer 2 — builds and runs on every
+platform, including Windows, over a process-local segment
+(`createLocalRing`, `createLocalBlockingRing`, `createLocalTypedQueue`) that
+the threads of one process share.
+
 Every layer has its own agnostic tests + benchmarks. See
 `reprobuild-specs/Shm-Queue-Library.md`.

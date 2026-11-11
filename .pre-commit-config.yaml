@@ -10,11 +10,12 @@
 # `git-hooks/mcl-standard-hooks.yaml` into a committed
 # `.pre-commit-config.yaml` and pins `rev:` to a devops-modules sha.
 #
-# THIS REPO HAS NO `flake.nix`, AND THAT IS NOT THE DEFECT. §4.1: "A repo that
-# is deliberately flake-free for Windows support is not defective; its fix is a
-# committed config, not a new flake." The defect was having no hooks at all -- a
-# `/nix/store` symlink produces nothing on Windows and nothing outside the
-# devShell, and this repo did not even have one of those.
+# THIS FILE IS THE RULE SET, NOT A FLAKE MODULE. The repo's `flake.nix` exists
+# to give CI and `repro.nim` a standalone dev env; it provides the tools these
+# hooks run (`language: system` entries, prek, uv) and deliberately installs
+# no hooks of its own, so it never competes with this committed config (§4.1:
+# "the flake provides the tools, the committed config provides the rules").
+# Windows developers, who have no Nix, use this same file.
 #
 # Install:  prek install --install-hooks     (or: pre-commit install)
 # Run:      prek run --all-files

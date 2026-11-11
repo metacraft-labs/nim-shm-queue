@@ -21,11 +21,19 @@
 ## generalised so `capacity` and `maxBlobLen` are RUNTIME parameters (stored in
 ## the header) rather than compile-time constants.
 ##
-## Platform: Linux + macOS (POSIX mmap MAP_SHARED). `shmSegmentSupported` is
-## false elsewhere; every op then reports an invalid segment so a caller can
-## fall back.
+## Platform scope. The CROSS-PROCESS segment (`createSegment` /
+## `attachSegment`: a file mapped MAP_SHARED, plus the pid-based consumer
+## liveness probe) is POSIX mmap and exists on Linux + macOS only;
+## `shmSegmentSupported` is false elsewhere, and both procs then return an
+## invalid segment so a caller can fall back. Everything else in this module is
+## platform-neutral and builds on every target, Windows included: the byte
+## layout, the offset-addressed atomics (C11/GCC `__atomic` builtins, which
+## MinGW gcc and clang provide on Windows as well), the block-producer
+## coordination block, and `createProcessLocalSegment`, the same segment layout
+## over an in-process allocation shared by the threads of one process.
 
 const shmSegmentSupported* = defined(linux) or defined(macosx)
+  ## True where the cross-process, file-backed segment is implemented.
 
 # --- alignment helpers (const-context usable) ------------------------------
 
@@ -117,26 +125,63 @@ func segRegionSize*(capacity, maxBlobLen: int): int {.inline.} =
   ## Page-rounded byte size of a ring segment with `capacity` slots.
   align4k(SegHeaderSize + capacity * slotStrideFor(maxBlobLen))
 
+import std/[os, times]
 when shmSegmentSupported:
-  import std/[os, posix, times]
+  import std/posix
 
-  type
-    ShmBase* = ptr UncheckedArray[byte]
-      ## The mapped base of the shared region; offsets are relative to this.
+type
+  ShmBase* = ptr UncheckedArray[byte]
+    ## The mapped base of the shared region; offsets are relative to this.
 
-    ShmSegment* = object
-      ## An attached view of a ring segment. `base` is nil / `size` is 0 on any
-      ## failure; `isValid` reports whether the mapping is live.
-      base*: ShmBase
-      size*: int
-      fd*: cint
-      path*: string
-      capacity*: int
-      maxBlobLen*: int
+  ShmSegment* = object
+    ## An attached view of a ring segment. `base` is nil / `size` is 0 on any
+    ## failure; `isValid` reports whether the mapping is live.
+    base*: ShmBase
+    size*: int
+    fd*: cint
+      ## Backing file descriptor of a cross-process segment; -1 otherwise.
+    path*: string
+      ## Backing file of a cross-process segment; empty for a process-local one.
+    capacity*: int
+    maxBlobLen*: int
+    processLocal*: bool
+      ## True when `base` is an in-process allocation from
+      ## `createProcessLocalSegment` (freed by `detach`), not a file mapping.
 
-  proc bootId*(): uint64 =
-    ## Per-boot identity used to invalidate a stale post-reboot segment. Same
-    ## shape as `repro_shm_index.bootId` / io-mon's `bootId`. Never returns zero.
+when defined(macosx):
+  proc sysctlbyname(name: cstring; oldp: pointer; oldlenp: ptr csize_t;
+      newp: pointer; newlen: csize_t): cint
+    {.importc, header: "<sys/sysctl.h>".}
+    ## Darwin `sysctlbyname(3)`; read here for `kern.boottime`.
+
+when not shmSegmentSupported:
+  # Without cross-process segments a segment never outlives the process that
+  # created it, so an identity fixed for the process lifetime is a valid boot
+  # identity there. It must not follow the wall clock: `registerConsumer`
+  # stamps `bootId()` and `consumerAlive` compares it with a later call, so a
+  # per-call clock reading would report a live consumer gone once a second
+  # boundary passed between the two.
+  let processBootId = uint64(epochTime().int64) or 1'u64
+
+proc bootId*(): uint64 =
+  ## Per-boot identity used to invalidate a stale post-reboot segment. Same
+  ## shape as `repro_shm_index.bootId` / io-mon's `bootId`. Never returns zero.
+  ##
+  ## It must be constant for the whole boot. `attachSegment` compares the
+  ## creator's stamp with the attacher's `bootId()`, and `consumerAlive`
+  ## compares the consumer's registration stamp with a later call, so a value
+  ## that drifts within one boot makes a later attach reject a live segment
+  ## and a producer report a live consumer gone.
+  ##
+  ## Linux reads `/proc/sys/kernel/random/boot_id`. macOS reads
+  ## `kern.boottime` (`sysctl(3)`): a `struct timeval` fixed at boot, to
+  ## microsecond resolution, the source nim-shm-gset's `platformBootId` uses
+  ## for the same guard. The wall-clock fallback is reached only when neither
+  ## source can be read; it changes every second, so there a segment outlives
+  ## at most the second it was created in.
+  when not shmSegmentSupported:
+    processBootId
+  else:
     when defined(linux):
       try:
         let raw = readFile("/proc/sys/kernel/random/boot_id")
@@ -147,144 +192,194 @@ when shmSegmentSupported:
         return (h or 1'u64)
       except CatchableError:
         discard
+    elif defined(macosx):
+      var tv: Timeval
+      var size = csize_t(sizeof(tv))
+      if sysctlbyname("kern.boottime", addr tv, addr size, nil, 0) == 0 and
+          size == csize_t(sizeof(tv)):
+        let secs = uint64(tv.tv_sec)
+        let usecs = uint64(tv.tv_usec)
+        if secs != 0'u64:
+          return ((secs * 1_000_000'u64 + usecs) or 1'u64)
     let secs = uint64(epochTime().int64)
     (secs or 1'u64)
 
-  proc isValid*(s: ShmSegment): bool {.inline.} =
-    not s.base.isNil and s.size > 0
+proc isValid*(s: ShmSegment): bool {.inline.} =
+  not s.base.isNil and s.size > 0
 
-  # --- offset-addressed atomics (C11/GCC builtins, no process-shared mutex) ---
-  template atField[T](base: ShmBase; offset: int): ptr T =
-    cast[ptr T](addr base[offset])
+# --- offset-addressed atomics (C11/GCC builtins, no process-shared mutex) ---
+#
+# Platform-neutral: they address bytes of whatever region `base` points at (a
+# MAP_SHARED file mapping, a process-local allocation, or a caller-owned
+# region under `EmbeddedRing`).
+template atField[T](base: ShmBase; offset: int): ptr T =
+  cast[ptr T](addr base[offset])
 
-  proc loadU64Acquire*(base: ShmBase; off: int): uint64 {.inline.} =
-    atomicLoadN(atField[uint64](base, off), ATOMIC_ACQUIRE)
-  proc loadU64Relaxed*(base: ShmBase; off: int): uint64 {.inline.} =
-    atomicLoadN(atField[uint64](base, off), ATOMIC_RELAXED)
-  proc storeU64Release*(base: ShmBase; off: int; v: uint64) {.inline.} =
-    atomicStoreN(atField[uint64](base, off), v, ATOMIC_RELEASE)
-  proc storeU64Relaxed*(base: ShmBase; off: int; v: uint64) {.inline.} =
-    atomicStoreN(atField[uint64](base, off), v, ATOMIC_RELAXED)
-  proc casU64*(base: ShmBase; off: int; expected: var uint64;
-      desired: uint64): bool {.inline.} =
-    atomicCompareExchangeN(atField[uint64](base, off), addr expected, desired,
-      false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE)
-  proc fetchAddU64*(base: ShmBase; off: int; delta: uint64): uint64 {.inline.} =
-    atomicAddFetch(atField[uint64](base, off), delta, ATOMIC_SEQ_CST)
-  proc fetchSubU64*(base: ShmBase; off: int; delta: uint64): uint64 {.inline.} =
-    atomicSubFetch(atField[uint64](base, off), delta, ATOMIC_SEQ_CST)
-  proc loadU32Relaxed*(base: ShmBase; off: int): uint32 {.inline.} =
-    atomicLoadN(atField[uint32](base, off), ATOMIC_RELAXED)
-  proc loadU32Acquire*(base: ShmBase; off: int): uint32 {.inline.} =
-    atomicLoadN(atField[uint32](base, off), ATOMIC_ACQUIRE)
-  proc storeU32Release*(base: ShmBase; off: int; v: uint32) {.inline.} =
-    atomicStoreN(atField[uint32](base, off), v, ATOMIC_RELEASE)
+proc loadU64Acquire*(base: ShmBase; off: int): uint64 {.inline.} =
+  atomicLoadN(atField[uint64](base, off), ATOMIC_ACQUIRE)
+proc loadU64Relaxed*(base: ShmBase; off: int): uint64 {.inline.} =
+  atomicLoadN(atField[uint64](base, off), ATOMIC_RELAXED)
+proc storeU64Release*(base: ShmBase; off: int; v: uint64) {.inline.} =
+  atomicStoreN(atField[uint64](base, off), v, ATOMIC_RELEASE)
+proc storeU64Relaxed*(base: ShmBase; off: int; v: uint64) {.inline.} =
+  atomicStoreN(atField[uint64](base, off), v, ATOMIC_RELAXED)
+proc casU64*(base: ShmBase; off: int; expected: var uint64;
+    desired: uint64): bool {.inline.} =
+  atomicCompareExchangeN(atField[uint64](base, off), addr expected, desired,
+    false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE)
+proc fetchAddU64*(base: ShmBase; off: int; delta: uint64): uint64 {.inline.} =
+  atomicAddFetch(atField[uint64](base, off), delta, ATOMIC_SEQ_CST)
+proc fetchSubU64*(base: ShmBase; off: int; delta: uint64): uint64 {.inline.} =
+  atomicSubFetch(atField[uint64](base, off), delta, ATOMIC_SEQ_CST)
+proc loadU32Relaxed*(base: ShmBase; off: int): uint32 {.inline.} =
+  atomicLoadN(atField[uint32](base, off), ATOMIC_RELAXED)
+proc loadU32Acquire*(base: ShmBase; off: int): uint32 {.inline.} =
+  atomicLoadN(atField[uint32](base, off), ATOMIC_ACQUIRE)
+proc storeU32Release*(base: ShmBase; off: int; v: uint32) {.inline.} =
+  atomicStoreN(atField[uint32](base, off), v, ATOMIC_RELEASE)
 
-  # --- futex-gated wait (opBlockProducer) ------------------------------------
-  #
-  # A blocking producer that finds the ring full waits on the `head` word so the
-  # consumer, on advancing `head`, wakes it. Linux uses `futex`; other POSIX
-  # hosts fall back to a short `nanosleep` poll (still liveness-checked, just
-  # without the wakeup syscall). The futex compares a 32-bit word: we wait on the
-  # LOW 32 bits of `head` (little-endian hosts only — asserted below), which the
-  # consumer bumps on every drain, so a wait can never miss a real advance for
-  # more than one 2^32 wrap (astronomically rare and bounded by the timeout).
-  when defined(linux):
-    when cpuEndian != littleEndian:
-      {.error: "opBlockProducer futex assumes a little-endian host".}
-    var SYS_futexNo {.importc: "SYS_futex", header: "<sys/syscall.h>".}: clong
-    proc rawSyscall(n: clong): clong {.
-      importc: "syscall", header: "<unistd.h>", varargs, discardable.}
-    const
-      FUTEX_WAIT_PRIVATE = 128
-      FUTEX_WAKE_PRIVATE = 129
+# --- futex-gated wait (opBlockProducer) ------------------------------------
+#
+# A blocking producer that finds the ring full waits on the `head` word so the
+# consumer, on advancing `head`, wakes it. Linux uses `futex`; other hosts fall
+# back to a short sleep poll (`nanosleep` on POSIX, `os.sleep` elsewhere) —
+# still liveness-checked, just without the wakeup syscall. The futex compares a
+# 32-bit word: we wait on the LOW 32 bits of `head` (little-endian hosts only —
+# asserted below), which the consumer bumps on every drain, so a wait can never
+# miss a real advance for more than one 2^32 wrap (astronomically rare and
+# bounded by the timeout).
+when defined(linux):
+  when cpuEndian != littleEndian:
+    {.error: "opBlockProducer futex assumes a little-endian host".}
+  var SYS_futexNo {.importc: "SYS_futex", header: "<sys/syscall.h>".}: clong
+  proc rawSyscall(n: clong): clong {.
+    importc: "syscall", header: "<unistd.h>", varargs, discardable.}
+  const
+    FUTEX_WAIT_PRIVATE = 128
+    FUTEX_WAKE_PRIVATE = 129
 
-    proc futexWaitHead*(base: ShmBase; expectedLow32: uint32;
-        timeoutNs: int64) {.inline.} =
-      ## Sleep until the low 32 bits of `head` differ from `expectedLow32`, a
-      ## wake arrives, or `timeoutNs` elapses. A spurious/timeout wake is fine —
-      ## the caller re-checks the ring + consumer liveness.
-      var ts: Timespec
-      ts.tv_sec = posix.Time(timeoutNs div 1_000_000_000)
-      ts.tv_nsec = clong(timeoutNs mod 1_000_000_000)
-      discard rawSyscall(SYS_futexNo, addr base[HdrOffHead],
-        cint(FUTEX_WAIT_PRIVATE), cint(expectedLow32), addr ts)
+  proc futexWaitHead*(base: ShmBase; expectedLow32: uint32;
+      timeoutNs: int64) {.inline.} =
+    ## Sleep until the low 32 bits of `head` differ from `expectedLow32`, a
+    ## wake arrives, or `timeoutNs` elapses. A spurious/timeout wake is fine —
+    ## the caller re-checks the ring + consumer liveness.
+    var ts: Timespec
+    ts.tv_sec = posix.Time(timeoutNs div 1_000_000_000)
+    ts.tv_nsec = clong(timeoutNs mod 1_000_000_000)
+    discard rawSyscall(SYS_futexNo, addr base[HdrOffHead],
+      cint(FUTEX_WAIT_PRIVATE), cint(expectedLow32), addr ts)
 
-    proc futexWakeHead*(base: ShmBase) {.inline.} =
-      ## Wake every producer waiting on `head`.
-      discard rawSyscall(SYS_futexNo, addr base[HdrOffHead],
-        cint(FUTEX_WAKE_PRIVATE), cint(high(int32)))
-  else:
-    proc futexWaitHead*(base: ShmBase; expectedLow32: uint32;
-        timeoutNs: int64) {.inline.} =
-      var ts = Timespec(tv_sec: posix.Time(timeoutNs div 1_000_000_000),
-        tv_nsec: clong(timeoutNs mod 1_000_000_000))
-      var rem: Timespec
-      discard nanosleep(ts, rem)
-    proc futexWakeHead*(base: ShmBase) {.inline.} = discard
+  proc futexWakeHead*(base: ShmBase) {.inline.} =
+    ## Wake every producer waiting on `head`.
+    discard rawSyscall(SYS_futexNo, addr base[HdrOffHead],
+      cint(FUTEX_WAKE_PRIVATE), cint(high(int32)))
+elif shmSegmentSupported:
+  proc futexWaitHead*(base: ShmBase; expectedLow32: uint32;
+      timeoutNs: int64) {.inline.} =
+    var ts = Timespec(tv_sec: posix.Time(timeoutNs div 1_000_000_000),
+      tv_nsec: clong(timeoutNs mod 1_000_000_000))
+    var rem: Timespec
+    discard nanosleep(ts, rem)
+  proc futexWakeHead*(base: ShmBase) {.inline.} = discard
+else:
+  proc futexWaitHead*(base: ShmBase; expectedLow32: uint32;
+      timeoutNs: int64) {.inline.} =
+    sleep(max(1, int(timeoutNs div 1_000_000)))
+  proc futexWakeHead*(base: ShmBase) {.inline.} = discard
 
-  # --- consumer-liveness token -----------------------------------------------
-  #
-  # A blocking producer must never wedge a monitored process against a dead or
-  # absent consumer (LF-4). The consumer registers its (pid, boot) and an `alive`
-  # flag; a waiting producer re-checks on every wake. Liveness is boot-guarded
-  # (a pid from a previous boot is meaningless) and probed with `kill(pid, 0)`.
+# --- consumer-liveness token -----------------------------------------------
+#
+# A blocking producer must never wedge a monitored process against a dead or
+# absent consumer (LF-4). The consumer registers its (pid, boot) and an `alive`
+# flag; a waiting producer re-checks on every wake. Liveness is boot-guarded
+# (a pid from a previous boot is meaningless) and, where cross-process segments
+# exist, probed with `kill(pid, 0)`.
 
-  proc registerConsumer*(base: ShmBase) =
-    ## Consumer side: publish this process as the live drainer. Call once before
-    ## producers may start waiting.
-    storeU64Relaxed(base, HdrOffConsumerBoot, bootId())
-    storeU64Relaxed(base, HdrOffConsumerPid, uint64(getpid()))
-    storeU64Release(base, HdrOffConsumerAlive, 1)
+proc registerConsumer*(base: ShmBase) =
+  ## Consumer side: publish this process as the live drainer. Call once before
+  ## producers may start waiting.
+  storeU64Relaxed(base, HdrOffConsumerBoot, bootId())
+  storeU64Relaxed(base, HdrOffConsumerPid, uint64(getCurrentProcessId()))
+  storeU64Release(base, HdrOffConsumerAlive, 1)
 
-  proc deregisterConsumer*(base: ShmBase) =
-    ## Consumer side: mark gone (clean shutdown) and wake any waiters so they
-    ## observe `prConsumerGone` promptly rather than waiting for the timeout.
-    storeU64Release(base, HdrOffConsumerAlive, 0)
-    futexWakeHead(base)
+proc deregisterConsumer*(base: ShmBase) =
+  ## Consumer side: mark gone (clean shutdown) and wake any waiters so they
+  ## observe `prConsumerGone` promptly rather than waiting for the timeout.
+  storeU64Release(base, HdrOffConsumerAlive, 0)
+  futexWakeHead(base)
 
-  proc consumerAlive*(base: ShmBase): bool =
-    ## Producer side: is the registered consumer alive on THIS boot? An
-    ## unregistered consumer (pid 0) is treated as alive — the consumer may not
-    ## have registered yet — so callers that need strict liveness must register.
-    let pid = loadU64Acquire(base, HdrOffConsumerPid)
-    if pid == 0:
-      return true
-    if loadU64Relaxed(base, HdrOffConsumerBoot) != bootId():
-      return false # registered on a previous boot ⇒ stale ⇒ gone
-    if loadU64Acquire(base, HdrOffConsumerAlive) == 0:
-      return false # explicit clean deregister
+proc consumerAlive*(base: ShmBase): bool =
+  ## Producer side: is the registered consumer alive on THIS boot? An
+  ## unregistered consumer (pid 0) is treated as alive — the consumer may not
+  ## have registered yet — so callers that need strict liveness must register.
+  let pid = loadU64Acquire(base, HdrOffConsumerPid)
+  if pid == 0:
+    return true
+  if loadU64Relaxed(base, HdrOffConsumerBoot) != bootId():
+    return false # registered on a previous boot ⇒ stale ⇒ gone
+  if loadU64Acquire(base, HdrOffConsumerAlive) == 0:
+    return false # explicit clean deregister
+  when shmSegmentSupported:
     if kill(Pid(pid), cint(0)) == 0:
       return true
     return errno != ESRCH # ESRCH ⇒ pid dead; EPERM ⇒ exists (alive)
+  else:
+    # Without cross-process segments the only segment a producer can reach is
+    # a process-local one, so a registered consumer is this very process.
+    pid == uint64(getCurrentProcessId())
 
+proc headerLooksValid(base: ShmBase; expectBoot: uint64): bool =
+  loadU64Acquire(base, HdrOffMagic) == ShmRingMagic and
+    loadU32Acquire(base, HdrOffFormatVersion) == ShmRingFormatVersion and
+    loadU64Relaxed(base, HdrOffCreatorBootId) == expectBoot
+
+proc initHeader(base: ShmBase; capacity, maxBlobLen: int; boot: uint64) =
+  storeU64Relaxed(base, HdrOffHead, 0)
+  storeU64Relaxed(base, HdrOffTail, 0)
+  storeU64Relaxed(base, HdrOffDropped, 0)
+  storeU64Relaxed(base, HdrOffWaiters, 0)
+  storeU64Relaxed(base, HdrOffConsumerPid, 0)
+  storeU64Relaxed(base, HdrOffConsumerBoot, 0)
+  storeU64Relaxed(base, HdrOffConsumerAlive, 0)
+  storeU32Release(base, HdrOffFormatVersion, ShmRingFormatVersion)
+  storeU64Relaxed(base, HdrOffFlags, 0)
+  storeU64Relaxed(base, HdrOffCapacity, uint64(capacity))
+  storeU64Relaxed(base, HdrOffMaxBlobLen, uint64(maxBlobLen))
+  storeU64Relaxed(base, HdrOffCreatorBootId, boot)
+  # Publish the magic LAST (release) so a concurrent attacher that observes
+  # the magic also observes the zeroed ring header + geometry fields.
+  storeU64Release(base, HdrOffMagic, ShmRingMagic)
+
+proc createProcessLocalSegment*(capacity, maxBlobLen: int;
+    boot: uint64): ShmSegment =
+  ## Create a fresh, zero-filled segment in this process's shared heap
+  ## (`allocShared0`), with exactly the layout `createSegment` maps from a file.
+  ## Every thread of the process may push into it; no other process can reach
+  ## it, so there is nothing to attach to (`path` is empty). Available on every
+  ## platform. `detach` frees it: release it exactly once, after every thread
+  ## using it has stopped.
+  result.base = nil
+  result.size = 0
+  result.fd = -1
+  result.capacity = capacity
+  result.maxBlobLen = maxBlobLen
+  if capacity <= 0 or maxBlobLen < 0:
+    return
+  let size = segRegionSize(capacity, maxBlobLen)
+  let p = cast[ShmBase](allocShared0(size))
+  if p.isNil:
+    return
+  result.base = p
+  result.size = size
+  result.processLocal = true
+  initHeader(p, capacity, maxBlobLen, boot)
+
+when shmSegmentSupported:
   proc mapFd(fd: cint; size: int): ShmBase =
     let p = mmap(nil, size, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0)
     if p == MAP_FAILED:
       return nil
     cast[ShmBase](p)
-
-  proc headerLooksValid(base: ShmBase; expectBoot: uint64): bool =
-    loadU64Acquire(base, HdrOffMagic) == ShmRingMagic and
-      loadU32Acquire(base, HdrOffFormatVersion) == ShmRingFormatVersion and
-      loadU64Relaxed(base, HdrOffCreatorBootId) == expectBoot
-
-  proc initHeader(base: ShmBase; capacity, maxBlobLen: int; boot: uint64) =
-    storeU64Relaxed(base, HdrOffHead, 0)
-    storeU64Relaxed(base, HdrOffTail, 0)
-    storeU64Relaxed(base, HdrOffDropped, 0)
-    storeU64Relaxed(base, HdrOffWaiters, 0)
-    storeU64Relaxed(base, HdrOffConsumerPid, 0)
-    storeU64Relaxed(base, HdrOffConsumerBoot, 0)
-    storeU64Relaxed(base, HdrOffConsumerAlive, 0)
-    storeU32Release(base, HdrOffFormatVersion, ShmRingFormatVersion)
-    storeU64Relaxed(base, HdrOffFlags, 0)
-    storeU64Relaxed(base, HdrOffCapacity, uint64(capacity))
-    storeU64Relaxed(base, HdrOffMaxBlobLen, uint64(maxBlobLen))
-    storeU64Relaxed(base, HdrOffCreatorBootId, boot)
-    # Publish the magic LAST (release) so a concurrent attacher that observes
-    # the magic also observes the zeroed ring header + geometry fields.
-    storeU64Release(base, HdrOffMagic, ShmRingMagic)
 
   proc createSegment*(path: string; capacity, maxBlobLen: int;
       boot: uint64): ShmSegment =
@@ -309,7 +404,17 @@ when shmSegmentSupported:
     let tfd = open(tmp.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
     if tfd < 0:
       return
-    if ftruncate(tfd, Off(size)) != 0:
+    # Size the file AND back every byte with storage. `ftruncate` alone leaves
+    # the region sparse, and on a full filesystem (tmpfs in particular) the
+    # first write through the MAP_SHARED mapping is then delivered as SIGBUS
+    # rather than as an error; `posix_fallocate` reports ENOSPC here instead,
+    # where it is still a clean "segment unavailable". Same fix and measurement
+    # as nim-shm-gset's `setFileSize` (rpi2, 2026-10-30). A filesystem that
+    # cannot preallocate (EOPNOTSUPP/EINVAL) keeps the previous ftruncate path.
+    let allocRc = posix_fallocate(tfd, Off(0), Off(size))
+    if allocRc != 0 and
+        not ((allocRc == EOPNOTSUPP or allocRc == EINVAL) and
+             ftruncate(tfd, Off(size)) == 0):
       discard close(tfd); removeFile(tmp); return
     discard close(tfd)
     try:
@@ -365,33 +470,29 @@ when shmSegmentSupported:
     result.capacity = int(loadU64Relaxed(p, HdrOffCapacity))
     result.maxBlobLen = int(loadU64Relaxed(p, HdrOffMaxBlobLen))
 
-  proc detach*(s: var ShmSegment) =
-    ## Unmap + close. Does NOT unlink the backing file (other processes may still
-    ## hold the segment). A default-constructed segment (base=nil) is a no-op;
-    ## fd 0 is never closed.
-    if not s.base.isNil:
-      discard munmap(cast[pointer](s.base), s.size)
-      s.base = nil
-      if s.fd > 0:
-        discard close(s.fd)
-    s.fd = -1
-    s.size = 0
-
 else:
-  type
-    ShmBase* = ptr UncheckedArray[byte]
-    ShmSegment* = object
-      base*: ShmBase
-      size*: int
-      path*: string
-      capacity*: int
-      maxBlobLen*: int
-
-  proc bootId*(): uint64 = 1'u64
-  proc isValid*(s: ShmSegment): bool = false
   proc createSegment*(path: string; capacity, maxBlobLen: int;
       boot: uint64): ShmSegment =
-    ShmSegment(path: path, capacity: capacity, maxBlobLen: maxBlobLen)
+    ## No cross-process segment on this platform: always invalid, so the caller
+    ## falls back (for in-process use, `createProcessLocalSegment`).
+    ShmSegment(fd: -1, path: path, capacity: capacity, maxBlobLen: maxBlobLen)
   proc attachSegment*(path: string): ShmSegment =
-    ShmSegment(path: path)
-  proc detach*(s: var ShmSegment) = discard
+    ## No cross-process segment on this platform: always invalid.
+    ShmSegment(fd: -1, path: path)
+
+proc detach*(s: var ShmSegment) =
+  ## Release this view. A file-backed segment is unmapped + closed, and its
+  ## backing file is NOT unlinked (other processes may still hold it). A
+  ## process-local segment is freed. A default-constructed segment (base=nil)
+  ## is a no-op; fd 0 is never closed.
+  if not s.base.isNil:
+    if s.processLocal:
+      deallocShared(s.base)
+    else:
+      when shmSegmentSupported:
+        discard munmap(cast[pointer](s.base), s.size)
+        if s.fd > 0:
+          discard close(s.fd)
+    s.base = nil
+  s.fd = -1
+  s.size = 0

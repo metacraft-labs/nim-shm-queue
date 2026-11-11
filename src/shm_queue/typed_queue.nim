@@ -67,6 +67,15 @@ proc createTypedQueue*[T, Format](path: string; cap, maxBlobLen: int;
   result.encStream = memoryOutput().s
   result.decBuf = newSeq[byte](max(maxBlobLen, 0))
 
+proc createLocalTypedQueue*[T, Format](cap, maxBlobLen: int;
+    boot: uint64): TypedShmQueue[T, Format] =
+  ## Typed queue over a PROCESS-LOCAL ring (`ring.createLocalRing`): the same
+  ## encode/push/drain/decode path as `createTypedQueue`, shared by the threads
+  ## of this process only, on every platform.
+  result.ring = createLocalRing(cap, maxBlobLen, boot)
+  result.encStream = memoryOutput().s
+  result.decBuf = newSeq[byte](max(maxBlobLen, 0))
+
 proc attachTypedQueue*[T, Format](path: string): TypedShmQueue[T, Format] =
   ## Attach to an existing typed queue segment. Invalid (so the caller can fall
   ## back / recreate) when the file is missing / wrong-sized / stale. Geometry is
@@ -76,7 +85,8 @@ proc attachTypedQueue*[T, Format](path: string): TypedShmQueue[T, Format] =
   result.decBuf = newSeq[byte](max(result.ring.maxBlobLen, 0))
 
 proc detach*(q: var TypedShmQueue) =
-  ## Unmap + close the underlying ring. Does NOT unlink the backing file.
+  ## Release the underlying ring (`ring.detach`): unmap + close a file-backed
+  ## one without unlinking the file, or free a process-local one.
   q.ring.detach()
 
 # --- typed push / drain -----------------------------------------------------
@@ -92,25 +102,22 @@ proc push*[T, Format](q: var TypedShmQueue[T, Format]; item: T): PushResult =
   ## `serialization`'s stream `writeValue` into a REUSED `memoryOutput` whose
   ## pages are recycled by `consumeContiguousOutput` on every call. The encoded
   ## bytes are copied directly into the reserved ring slot by `ring.tryPush`.
-  when not shmSegmentSupported:
+  if not q.ring.isValid:
     return prOversize
-  else:
-    if not q.ring.isValid:
-      return prOversize
-    # Serialize into the reused stream. `consumeContiguousOutput` hands us the
-    # contiguous encoded bytes AND recycles the stream's pages for the next push.
-    # Bind the ring into an addressable local so the consumer body does not
-    # capture the whole `var TypedShmQueue` (which cannot be captured safely).
-    writeValue(q.encStream, Format, item)
-    let maxLen = q.ring.maxBlobLen
-    let ringPtr = addr q.ring
-    var res = prPushed
-    consumeContiguousOutput(q.encStream, encoded):
-      if encoded.len > maxLen:
-        res = prOversize                 # queue unchanged; caller falls back
-      else:
-        res = ringPtr[].tryPush(encoded)
-    res
+  # Serialize into the reused stream. `consumeContiguousOutput` hands us the
+  # contiguous encoded bytes AND recycles the stream's pages for the next push.
+  # Bind the ring into an addressable local so the consumer body does not
+  # capture the whole `var TypedShmQueue` (which cannot be captured safely).
+  writeValue(q.encStream, Format, item)
+  let maxLen = q.ring.maxBlobLen
+  let ringPtr = addr q.ring
+  var res = prPushed
+  consumeContiguousOutput(q.encStream, encoded):
+    if encoded.len > maxLen:
+      res = prOversize                 # queue unchanged; caller falls back
+    else:
+      res = ringPtr[].tryPush(encoded)
+  res
 
 proc tryDrainOne*[T, Format](q: var TypedShmQueue[T, Format];
     item: var T): DrainResult =
@@ -118,16 +125,13 @@ proc tryDrainOne*[T, Format](q: var TypedShmQueue[T, Format];
   ## Returns `drEmpty` when nothing is ready; `drGot` when `item` was decoded.
   ## Decodes from the per-queue read buffer (no hot-path allocation for the
   ## drain itself; `T`'s own indirect fields allocate as the type requires).
-  when not shmSegmentSupported:
+  if not q.ring.isValid:
     return drEmpty
-  else:
-    if not q.ring.isValid:
-      return drEmpty
-    if q.decBuf.len < q.ring.maxBlobLen:
-      q.decBuf.setLen(q.ring.maxBlobLen)
-    var outLen = 0
-    let dr = q.ring.tryDrainOne(q.decBuf, outLen)
-    if dr != drGot:
-      return dr
-    item = Format.decode(q.decBuf.toOpenArray(0, outLen - 1), T)
-    drGot
+  if q.decBuf.len < q.ring.maxBlobLen:
+    q.decBuf.setLen(q.ring.maxBlobLen)
+  var outLen = 0
+  let dr = q.ring.tryDrainOne(q.decBuf, outLen)
+  if dr != drGot:
+    return dr
+  item = Format.decode(q.decBuf.toOpenArray(0, outLen - 1), T)
+  drGot

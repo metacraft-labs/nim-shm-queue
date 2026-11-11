@@ -6,22 +6,34 @@
 ## multi-PROCESS producers (fork), multi-THREAD producers, boot-guard rejection,
 ## version-mismatch attach, torn-write skipping, capacity edges, and detach /
 ## re-attach mid-stream.
+##
+## Platform scope. The ring's coordination (roundtrip, FIFO, wraparound, drop
+## signalling, capacity edges, torn writes, multi-thread producers, the
+## embedded ring) is platform-neutral and runs everywhere: over the
+## cross-process file-backed segment where `shmSegmentSupported` (Linux,
+## macOS), over a process-local segment elsewhere (Windows). The cases that
+## exercise the cross-process segment itself (boot guard, on-disk header
+## validation, re-attach, fork producers, file preallocation) need it and are
+## compiled only where it exists; elsewhere they print why and report SKIPPED.
 
-import std/[os, posix, sets, unittest]
+import std/[os, sets, unittest]
 import shm_queue/[ring, segment]
+when shmSegmentSupported:
+  import std/posix
 
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} =
-  ## Terminate a forked child WITHOUT running Nim/atexit teardown (which could
-  ## flush shared state or run destructors the parent still relies on).
-  cExit(code)
+  proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+  proc quitChild(code: cint) {.noreturn.} =
+    ## Terminate a forked child WITHOUT running Nim/atexit teardown (which could
+    ## flush shared state or run destructors the parent still relies on).
+    cExit(code)
 
 # --- helpers ---------------------------------------------------------------
 
 var tmpCounter = 0
 proc freshPath(tag: string): string =
   inc tmpCounter
-  getTempDir() / ("shmq-test-" & tag & "-" & $getpid() & "-" & $tmpCounter & ".seg")
+  getTempDir() / ("shmq-test-" & tag & "-" & $getCurrentProcessId() & "-" &
+    $tmpCounter & ".seg")
 
 proc cleanup(path: string) =
   try: removeFile(path)
@@ -39,6 +51,25 @@ proc drainInto(r: var ShmRing; buf: var seq[byte]): (DrainResult, int) =
 
 const TestBoot = 0xABCDEF01'u64
 
+proc makeRing(path: string; cap, maxBlobLen: int;
+    boot: uint64): ShmRing[opDropSignalled] =
+  ## The ring the platform-neutral cases run on: the cross-process file-backed
+  ## segment at `path` where it exists, a process-local segment elsewhere.
+  when shmSegmentSupported:
+    createRing(path, cap, maxBlobLen, boot)
+  else:
+    createLocalRing(cap, maxBlobLen, boot)
+
+template crossProcessSegmentOnly(reason: string; body: untyped) =
+  ## Compile `body` only where the cross-process segment exists; elsewhere say
+  ## why and mark the test SKIPPED (never a silent pass).
+  when shmSegmentSupported:
+    body
+  else:
+    echo "    SKIPPED: needs the cross-process shared-memory segment (" &
+      reason & "), which this platform does not implement"
+    skip()
+
 # --- blob roundtrip at boundary sizes --------------------------------------
 
 suite "blob roundtrip at boundary sizes":
@@ -46,7 +77,7 @@ suite "blob roundtrip at boundary sizes":
     let path = freshPath("roundtrip")
     defer: cleanup(path)
     const maxBlob = 64
-    var r = createRing(path, 8, maxBlob, TestBoot)
+    var r = makeRing(path, 8, maxBlob, TestBoot)
     check r.isValid
     check r.capacity == 8
     check r.maxBlobLen == maxBlob
@@ -72,7 +103,7 @@ suite "blob roundtrip at boundary sizes":
   test "drain into an undersized buffer -> drOverflowBuf, slot intact":
     let path = freshPath("overflowbuf")
     defer: cleanup(path)
-    var r = createRing(path, 4, 32, TestBoot)
+    var r = makeRing(path, 4, 32, TestBoot)
     let b = blobOf(20, 7)
     check r.tryPush(b) == prPushed
     var small = newSeq[byte](10)
@@ -93,7 +124,7 @@ suite "single-producer FIFO + wraparound":
   test "FIFO order preserved for a single producer":
     let path = freshPath("fifo")
     defer: cleanup(path)
-    var r = createRing(path, 8, 16, TestBoot)
+    var r = makeRing(path, 8, 16, TestBoot)
     var outBuf = newSeq[byte](16)
     # push 5, drain 5, verify order
     for i in 0 ..< 5:
@@ -110,7 +141,7 @@ suite "single-producer FIFO + wraparound":
     let path = freshPath("wrap")
     defer: cleanup(path)
     const cap = 8
-    var r = createRing(path, cap, 16, TestBoot)
+    var r = makeRing(path, cap, 16, TestBoot)
     var outBuf = newSeq[byte](16)
     let total = 2 * cap + 5 # 21 items, forces >2 full wraps of the slot array
     var pushed = 0
@@ -139,7 +170,7 @@ suite "ring-full drop signalling":
     let path = freshPath("full")
     defer: cleanup(path)
     const cap = 4
-    var r = createRing(path, cap, 16, TestBoot)
+    var r = makeRing(path, cap, 16, TestBoot)
     # Fill exactly cap slots without draining.
     for i in 0 ..< cap:
       check r.tryPush(@[byte(i)]) == prPushed
@@ -164,7 +195,7 @@ suite "ring-full drop signalling":
   test "cap=1 works":
     let path = freshPath("cap1")
     defer: cleanup(path)
-    var r = createRing(path, 1, 8, TestBoot)
+    var r = makeRing(path, 1, 8, TestBoot)
     check r.isValid
     check r.tryPush(@[byte 42]) == prPushed
     check r.tryPush(@[byte 43]) == prDropped # full at 1
@@ -188,7 +219,7 @@ suite "capacity edges":
     for badCap in [0, 3, 5, 6, 7, 9, 100, 1000]:
       let path = freshPath("badcap-" & $badCap)
       defer: cleanup(path)
-      var r = createRing(path, badCap, 16, TestBoot)
+      var r = makeRing(path, badCap, 16, TestBoot)
       check (not r.isValid)
       check (not fileExists(path)) # nothing was created
 
@@ -196,7 +227,7 @@ suite "capacity edges":
     for goodCap in [1, 2, 4, 8, 16, 1024]:
       let path = freshPath("goodcap-" & $goodCap)
       defer: cleanup(path)
-      var r = createRing(path, goodCap, 16, TestBoot)
+      var r = makeRing(path, goodCap, 16, TestBoot)
       check r.isValid
       check r.capacity == goodCap
       r.detach()
@@ -205,68 +236,107 @@ suite "capacity edges":
 
 suite "boot-guard":
   test "a segment stamped with a different bootId is rejected on attach":
-    let path = freshPath("bootguard")
-    defer: cleanup(path)
-    # Create stamped with an OLD boot id.
-    var creator = createRing(path, 8, 16, 0x1111_1111'u64)
-    check creator.isValid
-    check creator.tryPush(@[byte 1, 2, 3]) == prPushed
-    creator.detach() # segment file remains on disk
+    crossProcessSegmentOnly("attach validates the creator boot id"):
+      let path = freshPath("bootguard")
+      defer: cleanup(path)
+      # Create stamped with an OLD boot id.
+      var creator = createRing(path, 8, 16, 0x1111_1111'u64)
+      check creator.isValid
+      check creator.tryPush(@[byte 1, 2, 3]) == prPushed
+      creator.detach() # segment file remains on disk
 
-    # attachRing uses the CURRENT bootId(); a mismatch must be rejected (the
-    # real bootId() will not equal our synthetic old stamp).
-    var attached = attachRing(path)
-    check (not attached.isValid) # stale-boot segment not trusted
+      # attachRing uses the CURRENT bootId(); a mismatch must be rejected (the
+      # real bootId() will not equal our synthetic old stamp).
+      var attached = attachRing(path)
+      check (not attached.isValid) # stale-boot segment not trusted
 
-    # But attaching a segment stamped with the current boot succeeds.
-    let path2 = freshPath("bootguard-cur")
-    defer: cleanup(path2)
-    var cur = createRing(path2, 8, 16, bootId())
-    check cur.isValid
-    check cur.tryPush(@[byte 9]) == prPushed
-    cur.detach()
-    var att2 = attachRing(path2)
-    check att2.isValid
-    var outBuf = newSeq[byte](16)
-    let (dr, ol) = drainInto(att2, outBuf)
-    check dr == drGot
-    check ol == 1
-    check outBuf[0] == 9
-    att2.detach()
+      # But attaching a segment stamped with the current boot succeeds.
+      let path2 = freshPath("bootguard-cur")
+      defer: cleanup(path2)
+      var cur = createRing(path2, 8, 16, bootId())
+      check cur.isValid
+      check cur.tryPush(@[byte 9]) == prPushed
+      cur.detach()
+      var att2 = attachRing(path2)
+      check att2.isValid
+      var outBuf = newSeq[byte](16)
+      let (dr, ol) = drainInto(att2, outBuf)
+      check dr == drGot
+      check ol == 1
+      check outBuf[0] == 9
+      att2.detach()
+
+  test "the boot identity is stable across a real elapsed second":
+    # The boot guard and consumer liveness both compare a stored `bootId()`
+    # with a later call, so the identity must not change within one boot.
+    # On macOS it was the wall-clock second, recomputed per call: an attach
+    # or a liveness check made after a second boundary disagreed with the
+    # stamp. Two seconds of real time is the whole test, because the defect
+    # had one-second granularity and no shorter wait distinguishes "constant"
+    # from "constant for under a second". Runs on every platform: where there
+    # is no cross-process segment the identity is process-lifetime and must
+    # be stable too.
+    let first = bootId()
+    check first != 0'u64
+    sleep(2_100)
+    check bootId() == first
+
+  test "a segment created with bootId() still attaches seconds later":
+    crossProcessSegmentOnly("attach validates the creator boot id"):
+      # The consequence of the identity above at the level a consumer sees:
+      # a FRESH attach re-derives the boot id rather than inheriting the
+      # creator's, so it must accept a live segment after the clock moved.
+      let path = freshPath("bootguard-later")
+      defer: cleanup(path)
+      var creator = createRing(path, 8, 16, bootId())
+      check creator.isValid
+      check creator.tryPush(@[byte 7]) == prPushed
+      creator.detach()
+      sleep(2_100)
+      var att = attachRing(path)
+      check att.isValid
+      var outBuf = newSeq[byte](16)
+      let (dr, ol) = drainInto(att, outBuf)
+      check dr == drGot
+      check ol == 1
+      check outBuf[0] == 7
+      att.detach()
 
 # --- version-mismatch attach fails loudly ----------------------------------
 
 suite "version mismatch":
   test "a segment with a wrong formatVersion fails attach":
-    let path = freshPath("vermismatch")
-    defer: cleanup(path)
-    var r = createRing(path, 8, 16, bootId())
-    check r.isValid
-    r.detach()
-    # Corrupt the on-disk formatVersion field, then attach must reject it.
-    let fd = open(path.cstring, O_RDWR)
-    check fd >= 0
-    # HdrOffFormatVersion is the u32 right after the u64 magic.
-    var bad: uint32 = ShmRingFormatVersion + 99
-    check lseek(fd, Off(HdrOffFormatVersion), SEEK_SET) == Off(HdrOffFormatVersion)
-    check write(fd, addr bad, 4) == 4
-    check close(fd) == 0
-    var attached = attachRing(path)
-    check (not attached.isValid)
+    crossProcessSegmentOnly("attach validates the on-disk header"):
+      let path = freshPath("vermismatch")
+      defer: cleanup(path)
+      var r = createRing(path, 8, 16, bootId())
+      check r.isValid
+      r.detach()
+      # Corrupt the on-disk formatVersion field, then attach must reject it.
+      let fd = open(path.cstring, O_RDWR)
+      check fd >= 0
+      # HdrOffFormatVersion is the u32 right after the u64 magic.
+      var bad: uint32 = ShmRingFormatVersion + 99
+      check lseek(fd, Off(HdrOffFormatVersion), SEEK_SET) == Off(HdrOffFormatVersion)
+      check write(fd, addr bad, 4) == 4
+      check close(fd) == 0
+      var attached = attachRing(path)
+      check (not attached.isValid)
 
   test "a segment with a wrong magic fails attach":
-    let path = freshPath("magicmismatch")
-    defer: cleanup(path)
-    var r = createRing(path, 8, 16, bootId())
-    check r.isValid
-    r.detach()
-    let fd = open(path.cstring, O_RDWR)
-    check fd >= 0
-    var bad: uint64 = 0xDEADBEEF'u64
-    check lseek(fd, Off(HdrOffMagic), SEEK_SET) == Off(HdrOffMagic)
-    check write(fd, addr bad, 8) == 8
-    check close(fd) == 0
-    check (not attachRing(path).isValid)
+    crossProcessSegmentOnly("attach validates the on-disk header"):
+      let path = freshPath("magicmismatch")
+      defer: cleanup(path)
+      var r = createRing(path, 8, 16, bootId())
+      check r.isValid
+      r.detach()
+      let fd = open(path.cstring, O_RDWR)
+      check fd >= 0
+      var bad: uint64 = 0xDEADBEEF'u64
+      check lseek(fd, Off(HdrOffMagic), SEEK_SET) == Off(HdrOffMagic)
+      check write(fd, addr bad, 8) == 8
+      check close(fd) == 0
+      check (not attachRing(path).isValid)
 
 # --- torn-write tolerance --------------------------------------------------
 
@@ -275,7 +345,7 @@ suite "torn-write tolerance":
     let path = freshPath("torn")
     defer: cleanup(path)
     const cap = 8
-    var r = createRing(path, cap, 16, TestBoot)
+    var r = makeRing(path, cap, 16, TestBoot)
     # Simulate a producer that reserved ticket 0 (bumped tail) but has NOT yet
     # release-stored ready. We do this by directly manipulating the header: push
     # nothing, but bump tail so head(0) < tail(1) while slot 0 stays ready==0.
@@ -305,32 +375,33 @@ suite "torn-write tolerance":
 
 suite "detach + re-attach mid-stream":
   test "unread records survive a detach/re-attach":
-    let path = freshPath("reattach")
-    defer: cleanup(path)
-    var r = createRing(path, 8, 16, bootId())
-    for i in 0 ..< 5:
-      check r.tryPush(@[byte(i), byte(100 + i)]) == prPushed
-    var outBuf = newSeq[byte](16)
-    # Drain 2, leaving 3 unread.
-    for i in 0 ..< 2:
-      let (dr, ol) = drainInto(r, outBuf)
-      check dr == drGot
-      check outBuf[0] == byte(i)
-    check r.pendingCount() == 3
-    r.detach()
+    crossProcessSegmentOnly("re-attach to the backing file"):
+      let path = freshPath("reattach")
+      defer: cleanup(path)
+      var r = createRing(path, 8, 16, bootId())
+      for i in 0 ..< 5:
+        check r.tryPush(@[byte(i), byte(100 + i)]) == prPushed
+      var outBuf = newSeq[byte](16)
+      # Drain 2, leaving 3 unread.
+      for i in 0 ..< 2:
+        let (dr, ol) = drainInto(r, outBuf)
+        check dr == drGot
+        check outBuf[0] == byte(i)
+      check r.pendingCount() == 3
+      r.detach()
 
-    # Re-attach: the 3 unread records must still be there, in order.
-    var r2 = attachRing(path)
-    check r2.isValid
-    check r2.pendingCount() == 3
-    for i in 2 ..< 5:
-      let (dr, ol) = drainInto(r2, outBuf)
-      check dr == drGot
-      check ol == 2
-      check outBuf[0] == byte(i)
-      check outBuf[1] == byte(100 + i)
-    check r2.pendingCount() == 0
-    r2.detach()
+      # Re-attach: the 3 unread records must still be there, in order.
+      var r2 = attachRing(path)
+      check r2.isValid
+      check r2.pendingCount() == 3
+      for i in 2 ..< 5:
+        let (dr, ol) = drainInto(r2, outBuf)
+        check dr == drGot
+        check ol == 2
+        check outBuf[0] == byte(i)
+        check outBuf[1] == byte(100 + i)
+      check r2.pendingCount() == 0
+      r2.detach()
 
 # --- multi-THREAD producers ------------------------------------------------
 
@@ -342,16 +413,23 @@ suite "multi-thread producers":
     const perThread = 2000
     const cap = 1024
     # Big enough ring + active draining so we never force a full-ring drop.
-    var r = createRing(path, cap, 16, bootId())
+    var r = makeRing(path, cap, 16, bootId())
     check r.isValid
 
     type ProdArg = object
       path: string
+      ring: ptr ShmRing[opDropSignalled] ## the consumer's ring (process-local)
       tid: int
     var threads: array[nThreads, Thread[ProdArg]]
 
     proc producer(arg: ProdArg) {.thread.} =
-      var pr = attachRing(arg.path)
+      # Each producer gets its own view: an attach of the backing file where the
+      # cross-process segment exists, the consumer's process-local ring
+      # elsewhere (a ring is shared by address; only `base` is touched).
+      when shmSegmentSupported:
+        var pr = attachRing(arg.path)
+      else:
+        template pr: untyped = arg.ring[]
       doAssert pr.isValid
       var i = 0
       while i < perThread:
@@ -364,10 +442,12 @@ suite "multi-thread producers":
         if res == prPushed:
           inc i
         # on prDropped, retry the same i (consumer will catch up)
-      pr.detach()
+      when shmSegmentSupported:
+        pr.detach()
 
     for t in 0 ..< nThreads:
-      createThread(threads[t], producer, ProdArg(path: path, tid: t))
+      createThread(threads[t], producer,
+        ProdArg(path: path, ring: addr r, tid: t))
 
     # Consumer drains until it has collected nThreads*perThread unique items.
     var seen = initHashSet[(int, int)]()
@@ -393,104 +473,106 @@ suite "multi-thread producers":
 
 suite "multi-process producers (fork)":
   test "fork N children each pushing M blobs; parent drains exactly N*M":
-    let path = freshPath("procs")
-    defer: cleanup(path)
-    const nProc = 4
-    const perProc = 3000
-    const cap = 1024
-    var r = createRing(path, cap, 16, bootId())
-    check r.isValid
+    crossProcessSegmentOnly("fork producers attach by path"):
+      let path = freshPath("procs")
+      defer: cleanup(path)
+      const nProc = 4
+      const perProc = 3000
+      const cap = 1024
+      var r = createRing(path, cap, 16, bootId())
+      check r.isValid
 
-    var pids: seq[Pid]
-    for c in 0 ..< nProc:
-      let pid = fork()
-      if pid == 0:
-        # CHILD: attach the shared segment and push perProc distinct blobs.
-        var cr = attachRing(path)
-        if not cr.isValid:
-          quitChild(2)
-        var i = 0
-        while i < perProc:
-          var blob = newSeq[byte](8)
-          blob[0] = byte(c)
-          blob[1] = byte(i and 0xFF)
-          blob[2] = byte((i shr 8) and 0xFF)
-          blob[3] = byte((i shr 16) and 0xFF)
-          if cr.tryPush(blob) == prPushed:
-            inc i
-        cr.detach()
-        quitChild(0)
-      else:
-        check pid > 0
-        pids.add(pid)
+      var pids: seq[Pid]
+      for c in 0 ..< nProc:
+        let pid = fork()
+        if pid == 0:
+          # CHILD: attach the shared segment and push perProc distinct blobs.
+          var cr = attachRing(path)
+          if not cr.isValid:
+            quitChild(2)
+          var i = 0
+          while i < perProc:
+            var blob = newSeq[byte](8)
+            blob[0] = byte(c)
+            blob[1] = byte(i and 0xFF)
+            blob[2] = byte((i shr 8) and 0xFF)
+            blob[3] = byte((i shr 16) and 0xFF)
+            if cr.tryPush(blob) == prPushed:
+              inc i
+          cr.detach()
+          quitChild(0)
+        else:
+          check pid > 0
+          pids.add(pid)
 
-    # PARENT consumer: drain exactly nProc*perProc unique records.
-    var seen = initHashSet[(int, int)]()
-    var outBuf = newSeq[byte](16)
-    let target = nProc * perProc
-    while seen.len < target:
-      var outLen = 0
-      if r.tryDrainOne(outBuf, outLen) == drGot:
-        check outLen == 8
-        let c = int(outBuf[0])
-        let idx = int(outBuf[1]) or (int(outBuf[2]) shl 8) or (int(outBuf[3]) shl 16)
-        check (not seen.contains((c, idx)))
-        seen.incl((c, idx))
+      # PARENT consumer: drain exactly nProc*perProc unique records.
+      var seen = initHashSet[(int, int)]()
+      var outBuf = newSeq[byte](16)
+      let target = nProc * perProc
+      while seen.len < target:
+        var outLen = 0
+        if r.tryDrainOne(outBuf, outLen) == drGot:
+          check outLen == 8
+          let c = int(outBuf[0])
+          let idx = int(outBuf[1]) or (int(outBuf[2]) shl 8) or (int(outBuf[3]) shl 16)
+          check (not seen.contains((c, idx)))
+          seen.incl((c, idx))
 
-    for pid in pids:
-      var status: cint
-      discard waitpid(pid, status, 0)
-    # NO LOSS across process boundaries: exactly nProc*perProc distinct records
-    # crossed the shared mmap segment, each seen once. Children retry on a
-    # transient full ring, so every attempted record is eventually delivered.
-    check seen.len == target
-    r.detach()
+      for pid in pids:
+        var status: cint
+        discard waitpid(pid, status, 0)
+      # NO LOSS across process boundaries: exactly nProc*perProc distinct records
+      # crossed the shared mmap segment, each seen once. Children retry on a
+      # transient full ring, so every attempted record is eventually delivered.
+      check seen.len == target
+      r.detach()
 
   test "forced-full: dropped-count is exact (no draining until all children exit)":
-    let path = freshPath("procs-full")
-    defer: cleanup(path)
-    const nProc = 3
-    const perProc = 500
-    const cap = 8 # tiny ring; children will overflow it
-    var r = createRing(path, cap, 16, bootId())
-    check r.isValid
+    crossProcessSegmentOnly("fork producers attach by path"):
+      let path = freshPath("procs-full")
+      defer: cleanup(path)
+      const nProc = 3
+      const perProc = 500
+      const cap = 8 # tiny ring; children will overflow it
+      var r = createRing(path, cap, 16, bootId())
+      check r.isValid
 
-    var pids: seq[Pid]
-    for c in 0 ..< nProc:
-      let pid = fork()
-      if pid == 0:
-        var cr = attachRing(path)
-        if not cr.isValid:
-          quitChild(2)
-        # Each child attempts EXACTLY perProc pushes (no retry). Some are
-        # pushed, some dropped; the ring must account for every attempt.
-        for i in 0 ..< perProc:
-          discard cr.tryPush(@[byte(c), byte(i and 0xFF)])
-        cr.detach()
-        quitChild(0)
-      else:
-        check pid > 0
-        pids.add(pid)
+      var pids: seq[Pid]
+      for c in 0 ..< nProc:
+        let pid = fork()
+        if pid == 0:
+          var cr = attachRing(path)
+          if not cr.isValid:
+            quitChild(2)
+          # Each child attempts EXACTLY perProc pushes (no retry). Some are
+          # pushed, some dropped; the ring must account for every attempt.
+          for i in 0 ..< perProc:
+            discard cr.tryPush(@[byte(c), byte(i and 0xFF)])
+          cr.detach()
+          quitChild(0)
+        else:
+          check pid > 0
+          pids.add(pid)
 
-    for pid in pids:
-      var status: cint
-      discard waitpid(pid, status, 0)
+      for pid in pids:
+        var status: cint
+        discard waitpid(pid, status, 0)
 
-    # All children have exited. Now drain everything the ring holds.
-    var drainedCount = 0
-    var outBuf = newSeq[byte](16)
-    while true:
-      var outLen = 0
-      if r.tryDrainOne(outBuf, outLen) == drGot:
-        inc drainedCount
-      else:
-        break
-    let totalAttempts = nProc * perProc
-    # INVARIANT: every attempt is either pushed(+drained) or dropped, exactly.
-    check drainedCount.uint64 + r.droppedCount() == uint64(totalAttempts)
-    # And the ring is bounded: we can never have drained more than attempts.
-    check drainedCount <= totalAttempts
-    r.detach()
+      # All children have exited. Now drain everything the ring holds.
+      var drainedCount = 0
+      var outBuf = newSeq[byte](16)
+      while true:
+        var outLen = 0
+        if r.tryDrainOne(outBuf, outLen) == drGot:
+          inc drainedCount
+        else:
+          break
+      let totalAttempts = nProc * perProc
+      # INVARIANT: every attempt is either pushed(+drained) or dropped, exactly.
+      check drainedCount.uint64 + r.droppedCount() == uint64(totalAttempts)
+      # And the ring is bounded: we can never have drained more than attempts.
+      check drainedCount <= totalAttempts
+      r.detach()
 
 # --- EmbeddedRing: a ring living inside a caller-owned region ----------------
 #
@@ -501,71 +583,114 @@ suite "multi-process producers (fork)":
 # ring, and assert (a) push/drain/FIFO/drop parity with the owned ring and
 # (b) the caller's bytes BEFORE and AFTER the ring are never touched by the ring.
 
-when shmSegmentSupported:
-  import std/posix as posix2
+suite "EmbeddedRing over a caller-owned region":
+  test "push/drain/FIFO/drop parity + caller bytes untouched":
+    const
+      cap = 8
+      maxBlob = 48
+      guardHead = 64        # caller-owned header bytes BEFORE the ring
+      guardTail = 32        # caller-owned trailer bytes AFTER the ring
+    let ringBase = guardHead
+    let ringSpan = embeddedRingSize(cap, maxBlob)
+    let regionSize = ringBase + ringSpan + guardTail
 
-  suite "EmbeddedRing over a caller-owned region":
-    test "push/drain/FIFO/drop parity + caller bytes untouched":
-      const
-        cap = 8
-        maxBlob = 48
-        guardHead = 64        # caller-owned header bytes BEFORE the ring
-        guardTail = 32        # caller-owned trailer bytes AFTER the ring
-      let ringBase = guardHead
-      let ringSpan = embeddedRingSize(cap, maxBlob)
-      let regionSize = ringBase + ringSpan + guardTail
-
-      # A plain anonymous shared mapping stands in for the caller's region.
+    # A plain anonymous shared mapping stands in for the caller's region
+    # (a process-heap block where POSIX mmap is not available: the embedded
+    # ring is platform-neutral and does not care what backs the region).
+    when shmSegmentSupported:
       let p = mmap(nil, regionSize, PROT_READ or PROT_WRITE,
         MAP_SHARED or MAP_ANONYMOUS, -1, 0)
       check p != MAP_FAILED
-      let base = cast[ptr UncheckedArray[byte]](p)
-      # Stamp recognizable sentinel bytes into the caller-owned guard regions.
-      for i in 0 ..< guardHead: base[i] = byte(0xA0 + (i and 0x0F))
-      for i in 0 ..< guardTail:
-        base[ringBase + ringSpan + i] = byte(0xB0 + (i and 0x0F))
+    else:
+      let p = allocShared0(regionSize)
+      check p != nil
+    let base = cast[ptr UncheckedArray[byte]](p)
+    # Stamp recognizable sentinel bytes into the caller-owned guard regions.
+    for i in 0 ..< guardHead: base[i] = byte(0xA0 + (i and 0x0F))
+    for i in 0 ..< guardTail:
+      base[ringBase + ringSpan + i] = byte(0xB0 + (i and 0x0F))
 
-      var er = initEmbeddedRing(base, ringBase, cap, maxBlob)
-      resetEmbeddedRing(er)
-      check er.isValid
-      check er.capacity == cap
-      check er.maxBlobLen == maxBlob
+    var er = initEmbeddedRing(base, ringBase, cap, maxBlob)
+    resetEmbeddedRing(er)
+    check er.isValid
+    check er.capacity == cap
+    check er.maxBlobLen == maxBlob
 
-      var outBuf = newSeq[byte](maxBlob)
+    var outBuf = newSeq[byte](maxBlob)
 
-      # Roundtrip at boundary sizes + oversize reject.
-      for sz in [0, 1, maxBlob]:
-        let b = blobOf(sz, byte(sz))
-        check er.tryPush(b) == prPushed
-        var outLen = 0
-        check er.tryDrainOne(outBuf, outLen) == drGot
-        check outLen == sz
-        check outBuf[0 ..< sz] == b
-      check er.tryPush(blobOf(maxBlob + 1)) == prOversize
+    # Roundtrip at boundary sizes + oversize reject.
+    for sz in [0, 1, maxBlob]:
+      let b = blobOf(sz, byte(sz))
+      check er.tryPush(b) == prPushed
+      var outLen = 0
+      check er.tryDrainOne(outBuf, outLen) == drGot
+      check outLen == sz
+      check outBuf[0 ..< sz] == b
+    check er.tryPush(blobOf(maxBlob + 1)) == prOversize
 
-      # FIFO across a wraparound past 2*cap.
-      var expect = 0
-      for round in 0 ..< 3 * cap:
-        check er.tryPush(blobOf(4, byte(round))) == prPushed
-        var outLen = 0
-        check er.tryDrainOne(outBuf, outLen) == drGot
-        check outBuf[0 ..< 4] == blobOf(4, byte(round))
+    # FIFO across a wraparound past 2*cap.
+    var expect = 0
+    for round in 0 ..< 3 * cap:
+      check er.tryPush(blobOf(4, byte(round))) == prPushed
+      var outLen = 0
+      check er.tryDrainOne(outBuf, outLen) == drGot
+      check outBuf[0 ..< 4] == blobOf(4, byte(round))
 
-      # Fill without draining: overflow is a SIGNALLED drop.
-      for i in 0 ..< cap:
-        check er.tryPush(blobOf(4, byte(i))) == prPushed
-      check er.pendingCount() == uint64(cap)
-      var drops = 0
-      for i in 0 ..< 5:
-        if er.tryPush(blobOf(4)) == prDropped: inc drops
-      check drops == 5
-      check er.droppedCount() == 5'u64
+    # Fill without draining: overflow is a SIGNALLED drop.
+    for i in 0 ..< cap:
+      check er.tryPush(blobOf(4, byte(i))) == prPushed
+    check er.pendingCount() == uint64(cap)
+    var drops = 0
+    for i in 0 ..< 5:
+      if er.tryPush(blobOf(4)) == prDropped: inc drops
+    check drops == 5
+    check er.droppedCount() == 5'u64
 
-      # The caller-owned guard bytes are pristine — the ring never wrote outside
-      # `[ringBase, ringBase + ringSpan)`.
-      for i in 0 ..< guardHead:
-        check base[i] == byte(0xA0 + (i and 0x0F))
-      for i in 0 ..< guardTail:
-        check base[ringBase + ringSpan + i] == byte(0xB0 + (i and 0x0F))
+    # The caller-owned guard bytes are pristine — the ring never wrote outside
+    # `[ringBase, ringBase + ringSpan)`.
+    for i in 0 ..< guardHead:
+      check base[i] == byte(0xA0 + (i and 0x0F))
+    for i in 0 ..< guardTail:
+      check base[ringBase + ringSpan + i] == byte(0xB0 + (i and 0x0F))
 
+    when shmSegmentSupported:
       discard munmap(p, regionSize)
+    else:
+      deallocShared(p)
+
+suite "segment file backing":
+  test "a created ring's file is backed with storage, not left sparse":
+    crossProcessSegmentOnly("the segment file is preallocated"):
+      # `createSegment` writes the ring header through a MAP_SHARED mapping of a
+      # file it has just sized. A length recorded by `ftruncate` alone leaves the
+      # region sparse, and when the filesystem is full the first store faults
+      # with SIGBUS instead of returning an error (measured on rpi2's tmpfs
+      # `/tmp`, 2026-10-30, in the sibling nim-shm-gset library). The segment is
+      # therefore preallocated, and this measures it: `st_blocks` covers the
+      # length. The sparse file is the negative control that shows the
+      # filesystem can tell the two apart; where it cannot, the case is skipped.
+      proc allocatedBytes(path: string): int64 =
+        var st: Stat
+        doAssert stat(path.cstring, st) == 0
+        int64(st.st_blocks) * 512
+      var dir = getTempDir()
+      when defined(linux):
+        if dirExists("/dev/shm"): dir = "/dev/shm"
+      inc tmpCounter
+      let base = dir / ("shmq-test-backed-" & $getpid() & "-" & $tmpCounter)
+      let sparse = base & ".sparse"
+      let fd = open(sparse.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
+      doAssert fd >= 0
+      let size = segRegionSize(64, 256)
+      doAssert ftruncate(fd, Off(size)) == 0
+      discard close(fd)
+      defer: cleanup(sparse)
+      if allocatedBytes(sparse) >= size:
+        skip()
+      else:
+        let path = base & ".seg"
+        defer: cleanup(path)
+        var r = createRing(path, 64, 256, bootId())
+        check r.seg.isValid
+        check allocatedBytes(path) >= size          # PRIMARY ASSERTION
+        r.seg.detach()
